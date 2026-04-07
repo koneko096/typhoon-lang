@@ -683,7 +683,7 @@ mod tests {
                                 name: "Int32".into(),
                                 generic_args: vec![],
                             }),
-                            initializer: Expression::Literal(Literal::Int(1)),
+                            initializer: Expression::Literal(Literal::Int(1, None)),
                         },
                         Statement::If {
                             condition: Expression::Identifier(Identifier {
@@ -699,7 +699,7 @@ mod tests {
                             },
                             else_branch: Some(ElseBranch::Block(Block {
                                 statements: vec![Statement::Return(Some(Expression::Literal(
-                                    Literal::Int(0),
+                                    Literal::Int(0, None),
                                 )))],
                                 trailing_expression: None,
                             })),
@@ -752,7 +752,8 @@ mod tests {
                         kind: LoopKind::Block(loop_body.clone()),
                         body: loop_body,
                     }],
-                    trailing_expression: Some(Box::new(Expression::Literal(Literal::Int(0)))),
+                    trailing_expression: Some(Box::new(Expression::Literal(Literal::Int(0, None)))),
+
                 },
             }],
         };
@@ -787,7 +788,7 @@ mod tests {
                                 name: "Int32".into(),
                                 generic_args: vec![],
                             }),
-                            initializer: Expression::Literal(Literal::Int(1)),
+                            initializer: Expression::Literal(Literal::Int(1, None)),
                         },
                         Statement::Conc {
                             body: Block {
@@ -838,7 +839,7 @@ mod tests {
                                 name: "Int32".into(),
                                 generic_args: vec![],
                             }),
-                            initializer: Expression::Literal(Literal::Int(1)),
+                            initializer: Expression::Literal(Literal::Int(1, None)),
                         },
                         Statement::Expression(Expression::Identifier(Identifier {
                             name: "counter".into(),
@@ -949,7 +950,7 @@ mod tests {
                                 )],
                             },
                         },
-                        Statement::Return(Some(Expression::Literal(Literal::Int(0)))),
+                        Statement::Return(Some(Expression::Literal(Literal::Int(0, None)))), 
                     ],
                     trailing_expression: None,
                 },

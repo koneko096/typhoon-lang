@@ -220,15 +220,52 @@ impl IrBuilder {
                 } => {
                     // Special-case array literal initializers so we allocate a stack array
                     if let Expression::Literal(Literal::Array(elems)) = initializer {
-                        // All elements are assumed i32 for now
+                        // Infer element LLVM type from first literal element when possible
                         let len = elems.len();
-                        let array_ty = format!("[{} x i32]", len);
+                        let elem_ty = if let Some(first) = elems.get(0) {
+                            match first {
+                                Expression::Literal(Literal::Int(_, suffix)) => {
+                                    if let Some(s) = suffix {
+                                        match s.as_str() {
+                                            "i8" => "i8".to_string(),
+                                            "i16" => "i16".to_string(),
+                                            "i32" => "i32".to_string(),
+                                            "i64" => "i64".to_string(),
+                                            "u8" => "i8".to_string(),
+                                            _ => "i32".to_string(),
+                                        }
+                                    } else {
+                                        "i32".to_string()
+                                    }
+                                }
+                                Expression::Literal(Literal::Float(_, suffix)) => {
+                                    if let Some(s) = suffix {
+                                        match s.as_str() {
+                                            "f32" => "float".to_string(),
+                                            "f64" => "double".to_string(),
+                                            _ => "float".to_string(),
+                                        }
+                                    } else {
+                                        "float".to_string()
+                                    }
+                                }
+                                Expression::Literal(Literal::Bool(_)) => "i1".to_string(),
+                                _ => "i32".to_string(),
+                            }
+                        } else {
+                            "i32".to_string()
+                        };
+                        let array_ty = format!("[{} x {}]", len, elem_ty);
                         let alloca = self.next_register();
                         self.lines
                             .push(format!("  {} = alloca {}", alloca, array_ty));
                         for (i, elem_expr) in elems.iter().enumerate() {
                             let val = match elem_expr {
-                                Expression::Literal(Literal::Int(v)) => v.to_string(),
+                                Expression::Literal(Literal::Int(v, _)) => v.to_string(),
+                                Expression::Literal(Literal::Float(f, _)) => f.to_string(),
+                                Expression::Literal(Literal::Bool(b)) => {
+                                    if *b { "1".to_string() } else { "0".to_string() }
+                                }
                                 _ => self.emit_expr(elem_expr),
                             };
                             let gep = self.next_register();
@@ -237,7 +274,7 @@ impl IrBuilder {
                                 gep, array_ty, array_ty, alloca, i
                             ));
                             self.lines
-                                .push(format!("  store i32 {}, i32* {}", val, gep));
+                                .push(format!("  store {} {}, {}* {}", elem_ty, val, elem_ty, gep));
                         }
                         self.locals.insert(name.name.clone(), alloca.clone());
                         self.locals_type.insert(name.name.clone(), array_ty);
@@ -631,7 +668,7 @@ impl IrBuilder {
 
     fn emit_expr(&mut self, expr: &Expression) -> String {
         match expr {
-            Expression::Literal(Literal::Int(value)) => value.to_string(),
+            Expression::Literal(Literal::Int(value, _)) => value.to_string(),
             Expression::Literal(Literal::Bool(value)) => {
                 if *value {
                     "1".to_string()
@@ -655,29 +692,252 @@ impl IrBuilder {
                 }
             }
             Expression::BinaryOp { op, left, right } => {
+                // Determine LLVM type for this operation based on left expression when possible
+                fn is_float_ty(s: &str) -> bool {
+                    matches!(s, "float" | "double" | "half")
+                }
+                fn is_bool_ty(s: &str) -> bool {
+                    s == "i1"
+                }
+                fn is_int_ty(s: &str) -> bool {
+                    s.starts_with('i') && s != "i1"
+                }
+
+                let ty = match left.as_ref() {
+                    Expression::Identifier(id) => {
+                        self.locals_type.get(&id.name).cloned().unwrap_or_else(|| "i32".to_string())
+                    }
+                    Expression::Literal(Literal::Int(_v, suffix)) => {
+                        if let Some(s) = suffix {
+                            match s.as_str() {
+                                "i8" => "i8".to_string(),
+                                "i16" => "i16".to_string(),
+                                "i32" => "i32".to_string(),
+                                "i64" => "i64".to_string(),
+                                "u8" => "i8".to_string(),
+                                _ => "i32".to_string(),
+                            }
+                        } else {
+                            "i32".to_string()
+                        }
+                    }
+                    Expression::Literal(Literal::Float(_f, suffix)) => {
+                        if let Some(s) = suffix {
+                            match s.as_str() {
+                                "f32" => "float".to_string(),
+                                "f64" => "double".to_string(),
+                                _ => "float".to_string(),
+                            }
+                        } else {
+                            "float".to_string()
+                        }
+                    }
+                    Expression::Literal(Literal::Bool(_)) => "i1".to_string(),
+                    Expression::Call { func, .. } => {
+                        if let Expression::Identifier(id) = func.as_ref() {
+                            self.func_sigs.get(&id.name).map(|(r, _)| r.clone()).unwrap_or_else(|| "i32".to_string())
+                        } else { "i32".to_string() }
+                    }
+                    _ => "i32".to_string(),
+                };
+
+                // Handle compound-assign and pipe specially (existing code paths)
+                match op {
+                    Operator::AddAssign | Operator::SubAssign | Operator::MulAssign | Operator::DivAssign => {
+                        // Identifier LHS
+                        if let Expression::Identifier(id) = left.as_ref() {
+                            let slot = self.locals.get(&id.name).cloned().unwrap_or(id.name.clone());
+                            let lhs_val = self.next_register();
+                            self.lines.push(format!("  {} = load {}, {}* {}", lhs_val, ty, ty, slot));
+                            let rhs_val = self.emit_expr(right);
+                            let res = self.next_register();
+                            let instr = if is_float_ty(&ty) {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = fadd {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = fsub {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = fmul {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = fdiv {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = fadd {} {}, {}", res, ty, lhs_val, rhs_val),
+                                }
+                            } else {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = add {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = sub {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = mul {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = sdiv {} {}, {}", res, ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = add {} {}, {}", res, ty, lhs_val, rhs_val),
+                                }
+                            };
+                            self.lines.push(instr);
+                            self.lines.push(format!("  store {} {}, {}* {}", ty, res, ty, slot));
+                            return res;
+                        }
+                        // IndexAccess LHS: base[idx] += rhs
+                        if let Expression::IndexAccess { base, index } = left.as_ref() {
+                            // determine base pointer and array type
+                            let (base_ptr, array_ty) = if let Expression::Identifier(bid) = base.as_ref() {
+                                let ptr = self.locals.get(&bid.name).cloned().unwrap_or(bid.name.clone());
+                                let aty = self.locals_type.get(&bid.name).cloned().unwrap_or_else(|| "[0 x i32]".to_string());
+                                (ptr, aty)
+                            } else {
+                                (self.emit_expr(base), "[0 x i32]".to_string())
+                            };
+                            // infer element type from array_ty
+                            let elem_ty = if let Some(xpos) = array_ty.find(" x ") {
+                                let after = &array_ty[xpos + 3..];
+                                let end = after.find(']').unwrap_or(after.len());
+                                after[..end].to_string()
+                            } else { "i32".to_string() };
+                            let idx_val = self.emit_expr(index);
+                            let gep = self.next_register();
+                            self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, array_ty, array_ty, base_ptr, idx_val));
+                            let lhs_val = self.next_register();
+                            self.lines.push(format!("  {} = load {}, {}* {}", lhs_val, elem_ty, elem_ty, gep));
+                            let rhs_val = self.emit_expr(right);
+                            let res = self.next_register();
+                            let instr = if is_float_ty(&elem_ty) {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = fadd {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = fsub {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = fmul {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = fdiv {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = fadd {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                }
+                            } else {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = add {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = sub {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = mul {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = sdiv {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = add {} {}, {}", res, elem_ty, lhs_val, rhs_val),
+                                }
+                            };
+                            self.lines.push(instr);
+                            self.lines.push(format!("  store {} {}, {}* {}", elem_ty, res, elem_ty, gep));
+                            return res;
+                        }
+                        // FieldAccess LHS: base.field += rhs
+                        if let Expression::FieldAccess { base, field } = left.as_ref() {
+                            let (base_ptr, base_ty) = if let Expression::Identifier(bid) = base.as_ref() {
+                                let ptr = self.locals.get(&bid.name).cloned().unwrap_or(bid.name.clone());
+                                let bty = self.locals_type.get(&bid.name).cloned().unwrap_or_else(|| "%struct.?".to_string());
+                                (ptr, bty)
+                            } else {
+                                (self.emit_expr(base), "%struct.?".to_string())
+                            };
+                            let struct_name = base_ty.trim_start_matches("%struct.").to_string();
+                            let field_index = self.struct_fields.get(&struct_name).and_then(|fields| fields.iter().position(|f| f.0 == field.name)).unwrap_or(0);
+                            let field_ty = self.struct_fields.get(&struct_name).and_then(|fields| fields.get(field_index)).map(|(_, ty)| ty.clone()).unwrap_or_else(|| "i32".to_string());
+                            let gep = self.next_register();
+                            self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, base_ty, base_ty, base_ptr, field_index));
+                            let lhs_val = self.next_register();
+                            self.lines.push(format!("  {} = load {}, {}* {}", lhs_val, field_ty, field_ty, gep));
+                            let rhs_val = self.emit_expr(right);
+                            let res = self.next_register();
+                            let instr = if is_float_ty(&field_ty) {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = fadd {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = fsub {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = fmul {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = fdiv {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = fadd {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                }
+                            } else {
+                                match op {
+                                    Operator::AddAssign => format!("  {} = add {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::SubAssign => format!("  {} = sub {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::MulAssign => format!("  {} = mul {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    Operator::DivAssign => format!("  {} = sdiv {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                    _ => format!("  {} = add {} {}, {}", res, field_ty, lhs_val, rhs_val),
+                                }
+                            };
+                            self.lines.push(instr);
+                            self.lines.push(format!("  store {} {}, {}* {}", field_ty, res, field_ty, gep));
+                            return res;
+                        }
+                    }
+                    Operator::Pipe => {
+                        if let Expression::Call { func, args } = right.as_ref() {
+                            if let Expression::Identifier(id) = func.as_ref() {
+                                let mut arg_pairs = Vec::new();
+                                let lhs = self.emit_expr(left);
+                                let param_types = self.func_sigs.get(&id.name).map(|(_, p)| p.clone()).unwrap_or_else(|| vec![]);
+                                let first_ty = param_types.get(0).cloned().unwrap_or_else(|| "i32".to_string());
+                                arg_pairs.push(format!("{} {}", first_ty, lhs));
+                                for (idx, a) in args.iter().enumerate() {
+                                    let val = self.emit_expr(a);
+                                    let ty_a = param_types.get(idx+1).cloned().unwrap_or_else(|| "i32".to_string());
+                                    arg_pairs.push(format!("{} {}", ty_a, val));
+                                }
+                                let ret_ty = self.func_sigs.get(&id.name).map(|(r, _)| r.clone()).unwrap_or_else(|| "i32".to_string());
+                                let tmp = self.next_register();
+                                self.lines.push(format!("  {} = call {} @{}({})", tmp, ret_ty, id.name, arg_pairs.join(", ")));
+                                return tmp;
+                            }
+                        } else if let Expression::Identifier(id) = right.as_ref() {
+                            let lhs = self.emit_expr(left);
+                            let param_types = self.func_sigs.get(&id.name).map(|(_, p)| p.clone()).unwrap_or_else(|| vec![]);
+                            let ty0 = param_types.get(0).cloned().unwrap_or_else(|| "i32".to_string());
+                            let ret_ty = self.func_sigs.get(&id.name).map(|(r, _)| r.clone()).unwrap_or_else(|| "i32".to_string());
+                            let tmp = self.next_register();
+                            self.lines.push(format!("  {} = call {} @{}({} {})", tmp, ret_ty, id.name, ty0, lhs));
+                            return tmp;
+                        }
+                        let _ = self.emit_expr(left);
+                        let _ = self.emit_expr(right);
+                        return "0".to_string();
+                    }
+                    _ => {}
+                }
+
                 let lhs = self.emit_expr(left);
                 let rhs = self.emit_expr(right);
                 let tmp = self.next_register();
-                let instr = match op {
-                    Operator::Add => format!("  {} = add i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Sub => format!("  {} = sub i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Mul => format!("  {} = mul i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Div => format!("  {} = sdiv i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Mod => format!("  {} = srem i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Eq => format!("  {} = icmp eq i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Ne => format!("  {} = icmp ne i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Lt => format!("  {} = icmp slt i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Gt => format!("  {} = icmp sgt i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Le => format!("  {} = icmp sle i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Ge => format!("  {} = icmp sge i32 {}, {}", tmp, lhs, rhs),
-                    Operator::And => format!("  {} = and i1 {}, {}", tmp, lhs, rhs),
-                    Operator::Or => format!("  {} = or i1 {}, {}", tmp, lhs, rhs),
-                    Operator::BitAnd => format!("  {} = and i32 {}, {}", tmp, lhs, rhs),
-                    Operator::BitOr => format!("  {} = or i32 {}, {}", tmp, lhs, rhs),
-                    Operator::BitXor => format!("  {} = xor i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Shl => format!("  {} = shl i32 {}, {}", tmp, lhs, rhs),
-                    Operator::Shr => format!("  {} = lshr i32 {}, {}", tmp, lhs, rhs),
-                    _ => format!("  {} = add i32 {}, {}", tmp, lhs, rhs),
+                let instr = if is_float_ty(&ty) {
+                    match op {
+                        Operator::Add => format!("  {} = fadd {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Sub => format!("  {} = fsub {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Mul => format!("  {} = fmul {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Div => format!("  {} = fdiv {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Mod => format!("  {} = frem {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Eq => format!("  {} = fcmp oeq {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Ne => format!("  {} = fcmp one {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Lt => format!("  {} = fcmp olt {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Gt => format!("  {} = fcmp ogt {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Le => format!("  {} = fcmp ole {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Ge => format!("  {} = fcmp oge {} {}, {}", tmp, ty, lhs, rhs),
+                        _ => format!("  {} = fadd {} {}, {}", tmp, ty, lhs, rhs),
+                    }
+                } else if is_bool_ty(&ty) {
+                    match op {
+                        Operator::And => format!("  {} = and i1 {}, {}", tmp, lhs, rhs),
+                        Operator::Or => format!("  {} = or i1 {}, {}", tmp, lhs, rhs),
+                        Operator::Eq => format!("  {} = icmp eq i1 {}, {}", tmp, lhs, rhs),
+                        Operator::Ne => format!("  {} = icmp ne i1 {}, {}", tmp, lhs, rhs),
+                        _ => format!("  {} = or i1 {}, {}", tmp, lhs, rhs),
+                    }
+                } else { // integer-like
+                    match op {
+                        Operator::Add => format!("  {} = add {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Sub => format!("  {} = sub {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Mul => format!("  {} = mul {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Div => format!("  {} = sdiv {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Mod => format!("  {} = srem {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Eq => format!("  {} = icmp eq {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Ne => format!("  {} = icmp ne {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Lt => format!("  {} = icmp slt {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Gt => format!("  {} = icmp sgt {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Le => format!("  {} = icmp sle {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Ge => format!("  {} = icmp sge {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::And => format!("  {} = and {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Or => format!("  {} = or {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::BitAnd => format!("  {} = and {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::BitOr => format!("  {} = or {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::BitXor => format!("  {} = xor {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Shl => format!("  {} = shl {} {}, {}", tmp, ty, lhs, rhs),
+                        Operator::Shr => format!("  {} = lshr {} {}, {}", tmp, ty, lhs, rhs),
+                        _ => format!("  {} = add {} {}, {}", tmp, ty, lhs, rhs),
+                    }
                 };
                 self.lines.push(instr);
                 tmp
@@ -757,6 +1017,119 @@ impl IrBuilder {
                 }
                 base_ptr
             }
+            Expression::FieldAccess { base, field } => {
+                // Lower field access to GEP + load
+                let (base_ptr, base_ty) = if let Expression::Identifier(id) = base.as_ref() {
+                    let ptr = self.locals.get(&id.name).cloned().unwrap_or(id.name.clone());
+                    let ty = self.locals_type.get(&id.name).cloned().unwrap_or_else(|| "%struct.?".to_string());
+                    (ptr, ty)
+                } else if let Expression::StructInit { name, .. } = base.as_ref() {
+                    // struct init base: emit it and use its known struct type
+                    let ptr = self.emit_expr(base);
+                    let ty = format!("%struct.{}", name.name);
+                    (ptr, ty)
+                } else {
+                    (self.emit_expr(base), "%struct.?".to_string())
+                };
+                let struct_name = base_ty.trim_start_matches("%struct.").to_string();
+                // If base_ptr is a temporary value (not an address), allocate a temp slot and store the value so we have a pointer
+                if base_ptr.starts_with("%t") && base_ty.starts_with("%struct.") {
+                    let temp_slot = self.next_register();
+                    self.lines.push(format!("  {} = alloca {}", temp_slot, base_ty));
+                    self.lines.push(format!("  store {} {}, {}* {}", base_ty, base_ptr, base_ty, temp_slot));
+                    // use the slot as the base pointer
+                    let base_ptr = temp_slot;
+                    let field_index = self.struct_fields.get(&struct_name).and_then(|fields| fields.iter().position(|f| f.0 == field.name)).unwrap_or(0);
+                    let field_ty = self.struct_fields.get(&struct_name).and_then(|fields| fields.get(field_index)).map(|(_, ty)| ty.clone()).unwrap_or_else(|| "i32".to_string());
+                    let gep = self.next_register();
+                    self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, base_ty, base_ty, base_ptr, field_index));
+                    let tmp = self.next_register();
+                    self.lines.push(format!("  {} = load {}, {}* {}", tmp, field_ty, field_ty, gep));
+                    tmp
+                } else {
+                    let field_index = self.struct_fields.get(&struct_name).and_then(|fields| fields.iter().position(|f| f.0 == field.name)).unwrap_or(0);
+                    let field_ty = self.struct_fields.get(&struct_name).and_then(|fields| fields.get(field_index)).map(|(_, ty)| ty.clone()).unwrap_or_else(|| "i32".to_string());
+                    let gep = self.next_register();
+                    self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, base_ty, base_ty, base_ptr, field_index));
+                    let tmp = self.next_register();
+                    self.lines.push(format!("  {} = load {}, {}* {}", tmp, field_ty, field_ty, gep));
+                    tmp
+                }
+            }
+            Expression::IndexAccess { base, index } => {
+                // Lower index access to GEP + load for stack arrays
+                let (base_ptr, array_ty) = if let Expression::Identifier(id) = base.as_ref() {
+                    let ptr = self.locals.get(&id.name).cloned().unwrap_or(id.name.clone());
+                    let aty = self.locals_type.get(&id.name).cloned().unwrap_or_else(|| "[0 x i32]".to_string());
+                    (ptr, aty)
+                } else if let Expression::Literal(Literal::Array(elems)) = base.as_ref() {
+                    // If base is an inline array literal, allocate a temp alloca and populate it so we can index into it.
+                    let len = elems.len();
+                    let elem_ty = if let Some(first) = elems.get(0) {
+                        match first {
+                            Expression::Literal(Literal::Int(_, suffix)) => {
+                                if let Some(s) = suffix {
+                                    match s.as_str() {
+                                        "i8" => "i8".to_string(),
+                                        "i16" => "i16".to_string(),
+                                        "i32" => "i32".to_string(),
+                                        "i64" => "i64".to_string(),
+                                        "u8" => "i8".to_string(),
+                                        _ => "i32".to_string(),
+                                    }
+                                } else { "i32".to_string() }
+                            }
+                            Expression::Literal(Literal::Float(_, suffix)) => {
+                                if let Some(s) = suffix {
+                                    match s.as_str() {
+                                        "f32" => "float".to_string(),
+                                        "f64" => "double".to_string(),
+                                        _ => "float".to_string(),
+                                    }
+                                } else { "float".to_string() }
+                            }
+                            Expression::Literal(Literal::Bool(_)) => "i1".to_string(),
+                            _ => "i32".to_string(),
+                        }
+                    } else { "i32".to_string() };
+                    let array_ty = format!("[{} x {}]", len, elem_ty);
+                    let alloca = self.next_register();
+                    self.lines.push(format!("  {} = alloca {}", alloca, array_ty));
+                    for (i, elem_expr) in elems.iter().enumerate() {
+                        let val = match elem_expr {
+                            Expression::Literal(Literal::Int(v, _)) => v.to_string(),
+                            Expression::Literal(Literal::Float(f, _)) => f.to_string(),
+                            Expression::Literal(Literal::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
+                            _ => self.emit_expr(elem_expr),
+                        };
+                        let gep = self.next_register();
+                        self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, array_ty, array_ty, alloca, i));
+                        self.lines.push(format!("  store {} {}, {}* {}", elem_ty, val, elem_ty, gep));
+                    }
+                    (alloca, array_ty)
+                } else {
+                    (self.emit_expr(base), "[0 x i32]".to_string())
+                };
+                // infer element type
+                let elem_ty = if let Some(xpos) = array_ty.find(" x ") {
+                    let after = &array_ty[xpos + 3..];
+                    let end = after.find(']').unwrap_or(after.len());
+                    after[..end].to_string()
+                } else { "i32".to_string() };
+                // If base_ptr is a temporary value (not an address), and we have an array type, allocate a temp slot and store so we can GEP into it
+                let actual_base_ptr = if base_ptr.starts_with("%t") && array_ty.starts_with('[') {
+                    let temp_slot = self.next_register();
+                    self.lines.push(format!("  {} = alloca {}", temp_slot, array_ty));
+                    self.lines.push(format!("  store {} {}, {}* {}", array_ty, base_ptr, array_ty, temp_slot));
+                    temp_slot
+                } else { base_ptr };
+                let idx_val = self.emit_expr(index);
+                let gep = self.next_register();
+                self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, array_ty, array_ty, actual_base_ptr, idx_val));
+                let tmp = self.next_register();
+                self.lines.push(format!("  {} = load {}, {}* {}", tmp, elem_ty, elem_ty, gep));
+                tmp
+            }
             Expression::Call { func, args } => {
                 if let Expression::Identifier(id) = func.as_ref() {
                     let (ret_ty, param_types) = match self.func_sigs.get(&id.name) {
@@ -784,6 +1157,10 @@ impl IrBuilder {
                 }
                 "0".to_string()
             }
+            Expression::TryOperator { expr } => {
+                // Lower try to the inner expression for now (no-op)
+                return self.emit_expr(expr);
+            }
             Expression::Match { expr, arms } => {
                 let _ = self.emit_expr(expr);
                 for arm in arms {
@@ -803,11 +1180,19 @@ impl IrBuilder {
 
     fn lower_type(&self, ty: &Type) -> String {
         match ty.name.as_str() {
+            "Int8" => "i8".to_string(),
+            "Int16" => "i16".to_string(),
             "Int32" => "i32".to_string(),
+            "Int64" => "i64".to_string(),
+            "Float16" => "half".to_string(),
+            "Float32" => "float".to_string(),
+            "Float64" => "double".to_string(),
             "Bool" => "i1".to_string(),
             "Str" => "i8*".to_string(),
             "Buf" => "%struct.Buf*".to_string(),
             "ref" => "i8*".to_string(),
+            "Char" => "i8".to_string(),
+            "Byte" => "i8".to_string(),
             name => format!("%struct.{}", name),
         }
     }

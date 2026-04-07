@@ -2,8 +2,8 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i64),
-    Float(f64),
+    Int(i64, Option<String>),
+    Float(f64, Option<String>),
     Bool(bool),
     Str(String),
     Array(Vec<Expression>),

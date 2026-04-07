@@ -73,15 +73,50 @@ impl Resolver {
         declaration: &Declaration,
     ) -> Result<(), String> {
         match declaration {
-            Declaration::Function { params, body, .. } => {
+            Declaration::Function { params, body, return_type, .. } => {
+                // validate types used in parameters/return before resolving body
+                for param in params {
+                    if let Err(err) = self.resolve_type(scope, &param.type_annotation) {
+                        return Err(err);
+                    }
+                }
+                if let Some(ret) = return_type {
+                    if let Err(err) = self.resolve_type(scope, ret) {
+                        return Err(err);
+                    }
+                }
+
                 let fn_scope = self.enter_scope(Some(scope));
                 for param in params {
                     self.declare(fn_scope, param.name.clone())?;
                 }
                 self.resolve_block(fn_scope, body)
             }
-            Declaration::Struct { .. } | Declaration::Enum { .. } | Declaration::Newtype { .. } => {
+            Declaration::Struct { fields, .. } => {
+                // Validate field types
+                for (_name, ty) in fields {
+                    self.resolve_type(scope, ty)?;
+                }
                 Ok(())
+            }
+            Declaration::Enum { variants, .. } => {
+                for variant in variants {
+                    if let Some(payload) = &variant.payload {
+                        match payload {
+                            EnumVariantPayload::Tuple(types) => {
+                                for ty in types { self.resolve_type(scope, ty)?; }
+                            }
+                            EnumVariantPayload::Struct(fields) => {
+                                for (_id, ty) in fields { self.resolve_type(scope, ty)?; }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Declaration::Newtype { type_alias, .. } => {
+                self.resolve_type(scope, type_alias)
             }
             Declaration::Use(path) => {
                 if let Some(segment) = path.segments.last() {
@@ -95,6 +130,41 @@ impl Resolver {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    // Resolve type names used in annotations: allow primitives and previously-declared types.
+    fn resolve_type(&self, scope: ScopeId, ty: &crate::ast::Type) -> Result<(), String> {
+        // Recurse into generics first
+        for arg in &ty.generic_args {
+            self.resolve_type(scope, arg)?;
+        }
+
+        // 'ref' is a built-in wrapper: its inner arg is already checked above.
+        if ty.name == "ref" {
+            return Ok(());
+        }
+
+        // Accept common primitive names without declaration
+        let primitives = [
+            "Int8", "Int16", "Int32", "Int64", "Float16", "Float32", "Float64",
+            "Bool", "Str", "Char", "Byte",
+        ];
+        if primitives.contains(&ty.name.as_str()) {
+            return Ok(());
+        }
+
+        // Types like Option/Result/Buf/Map are treated as named generics; accept if used but warn if not declared
+        let common_named = ["Option", "Result", "Buf", "Map", "Set"];
+        if common_named.contains(&ty.name.as_str()) {
+            return Ok(());
+        }
+
+        // Otherwise, ensure the type name resolves to a declaration in scope
+        if self.lookup(scope, &ty.name).is_some() {
+            Ok(())
+        } else {
+            Err(format!("Unknown type '{}', expected a struct/enum/newtype or builtin", ty.name))
         }
     }
 

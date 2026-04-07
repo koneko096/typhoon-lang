@@ -218,7 +218,62 @@ impl Parser {
 
 
     fn expression(&mut self) -> Result<Expression, String> {
-        self.equality()
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> Result<Expression, String> {
+        let expr = self.pipe()?;
+        // Handle assignment and compound-assign (right-associative)
+        if self.match_token(TokenType::Assign) {
+            let value = self.assignment()?;
+            return Ok(Expression::BinaryOp {
+                op: Operator::Assign,
+                left: Box::new(expr),
+                right: Box::new(value),
+            });
+        } else if self.match_token(TokenType::PlusAssign) {
+            let value = self.assignment()?;
+            return Ok(Expression::BinaryOp {
+                op: Operator::AddAssign,
+                left: Box::new(expr),
+                right: Box::new(value),
+            });
+        } else if self.match_token(TokenType::MinusAssign) {
+            let value = self.assignment()?;
+            return Ok(Expression::BinaryOp {
+                op: Operator::SubAssign,
+                left: Box::new(expr),
+                right: Box::new(value),
+            });
+        } else if self.match_token(TokenType::StarAssign) {
+            let value = self.assignment()?;
+            return Ok(Expression::BinaryOp {
+                op: Operator::MulAssign,
+                left: Box::new(expr),
+                right: Box::new(value),
+            });
+        } else if self.match_token(TokenType::SlashAssign) {
+            let value = self.assignment()?;
+            return Ok(Expression::BinaryOp {
+                op: Operator::DivAssign,
+                left: Box::new(expr),
+                right: Box::new(value),
+            });
+        }
+        Ok(expr)
+    }
+
+    fn pipe(&mut self) -> Result<Expression, String> {
+        let mut expr = self.equality()?;
+        while self.match_token(TokenType::Pipe) {
+            let right = self.equality()?;
+            expr = Expression::BinaryOp {
+                op: Operator::Pipe,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
     }
 
     fn equality(&mut self) -> Result<Expression, String> {
@@ -241,7 +296,7 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Result<Expression, String> {
-        let mut expr = self.term()?;
+        let mut expr = self.shift()?;
         while let Some(op) = if self.match_token(TokenType::LessThan) {
             Some(Operator::Lt)
         } else if self.match_token(TokenType::LessThanOrEqual) {
@@ -250,6 +305,25 @@ impl Parser {
             Some(Operator::Gt)
         } else if self.match_token(TokenType::GreaterThanOrEqual) {
             Some(Operator::Ge)
+        } else {
+            None
+        } {
+            let right = self.shift()?;
+            expr = Expression::BinaryOp {
+                op,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn shift(&mut self) -> Result<Expression, String> {
+        let mut expr = self.term()?;
+        while let Some(op) = if self.match_token(TokenType::ShiftLeft) {
+            Some(Operator::Shl)
+        } else if self.match_token(TokenType::ShiftRight) {
+            Some(Operator::Shr)
         } else {
             None
         } {
@@ -311,21 +385,57 @@ impl Parser {
                 expr: Box::new(expr),
             });
         }
-        self.primary()
+        // parse primary then allow postfix try operator '?'
+        let mut expr = self.primary()?;
+        while self.match_token(TokenType::Try) {
+            expr = Expression::TryOperator { expr: Box::new(expr) };
+        }
+        Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Expression, String> {
         let token = self.advance();
-        match token.token_type {
-            TokenType::IntLit => Ok(Expression::Literal(Literal::Int(
-                token.lexeme.parse().unwrap(),
-            ))),
-            TokenType::FloatLit => Ok(Expression::Literal(Literal::Float(
-                token.lexeme.parse().unwrap(),
-            ))),
-            TokenType::StrLit => Ok(Expression::Literal(Literal::Str(token.lexeme))),
-            TokenType::True => Ok(Expression::Literal(Literal::Bool(true))),
-            TokenType::False => Ok(Expression::Literal(Literal::Bool(false))),
+        let expr = match token.token_type {
+            TokenType::IntLit => {
+                // split suffix (e.g., 42i64, 42u8)
+                let lex = token.lexeme.clone();
+                let mut digits = String::new();
+                let mut suffix: Option<String> = None;
+                for ch in lex.chars() {
+                    if ch.is_ascii_digit() || ch == '_' {
+                        digits.push(ch);
+                    } else {
+                        suffix = Some(lex[digits.len()..].to_string());
+                        break;
+                    }
+                }
+                let digits_clean: String = digits.chars().filter(|c| *c != '_').collect();
+                let val: i64 = digits_clean.parse().unwrap();
+                Expression::Literal(Literal::Int(val, suffix))
+            }
+            TokenType::FloatLit => {
+                // handle float suffixes like 3.14f64
+                let lex = token.lexeme.clone();
+                // find first alphabetic char as suffix
+                let mut idx = None;
+                for (i, ch) in lex.chars().enumerate() {
+                    if ch.is_ascii_alphabetic() {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                let (num_part, suffix) = if let Some(i) = idx {
+                    (lex[..i].to_string(), Some(lex[i..].to_string()))
+                } else {
+                    (lex.clone(), None)
+                };
+                let num_clean: String = num_part.chars().filter(|c| *c != '_').collect();
+                let val: f64 = num_clean.parse().unwrap();
+                Expression::Literal(Literal::Float(val, suffix))
+            },
+            TokenType::StrLit => Expression::Literal(Literal::Str(token.lexeme)),
+            TokenType::True => Expression::Literal(Literal::Bool(true)),
+            TokenType::False => Expression::Literal(Literal::Bool(false)),
             TokenType::Identifier => {
                 let ident = Expression::Identifier(Identifier { name: token.lexeme });
                 // Check for a function call: identifier followed by '('
@@ -339,18 +449,18 @@ impl Parser {
                         }
                     }
                     self.consume(TokenType::RParen, "Expected ')' after arguments")?;
-                    Ok(Expression::Call {
+                    Expression::Call {
                         func: Box::new(ident),
                         args,
-                    })
+                    }
                 } else {
-                    Ok(ident)
+                    ident
                 }
             }
             TokenType::LParen => {
                 let expr = self.expression()?;
                 self.consume(TokenType::RParen, "Expected ')'")?;
-                Ok(expr)
+                expr
             }
             TokenType::LBracket => {
                 // Parse array literal: [ expr, expr, ... ]
@@ -362,11 +472,37 @@ impl Parser {
                     }
                 }
                 self.consume(TokenType::RBracket, "Expected ']' after array literal")?;
-                Ok(Expression::Literal(Literal::Array(elems)))
+                Expression::Literal(Literal::Array(elems))
             }
-            TokenType::LBrace => self.merge_expression(),
-            _ => Err(format!("Expected expression, got {:?}", token)),
+            TokenType::LBrace => self.merge_expression()?,
+            _ => return Err(format!("Expected expression, got {:?}", token)),
+        };
+        self.primary_postfix(expr)
+    }
+
+    // After primary expression parsed, allow postfix field and index access
+    fn primary_postfix(&mut self, mut expr: Expression) -> Result<Expression, String> {
+        loop {
+            if self.match_token(TokenType::Dot) {
+                let field = self.identifier()?;
+                expr = Expression::FieldAccess {
+                    base: Box::new(expr),
+                    field,
+                };
+                continue;
+            }
+            if self.match_token(TokenType::LBracket) {
+                let index = self.expression()?;
+                self.consume(TokenType::RBracket, "Expected ']' after index access")?;
+                expr = Expression::IndexAccess {
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                };
+                continue;
+            }
+            break;
         }
+        Ok(expr)
     }
 
     fn parse_type(&mut self) -> Result<Type, String> {
@@ -533,13 +669,40 @@ impl Parser {
             }
             TokenType::IntLit => {
                 let t = self.advance();
-                let val = t.lexeme.parse().map_err(|e| format!("Invalid int literal: {}", e))?;
-                Ok(Pattern::Literal(Literal::Int(val)))
+                // parse suffix similar to primary
+                let lex = t.lexeme.clone();
+                let mut digits = String::new();
+                let mut suffix: Option<String> = None;
+                for ch in lex.chars() {
+                    if ch.is_ascii_digit() || ch == '_' {
+                        digits.push(ch);
+                    } else {
+                        suffix = Some(lex[digits.len()..].to_string());
+                        break;
+                    }
+                }
+                let digits_clean: String = digits.chars().filter(|c| *c != '_').collect();
+                let val: i64 = digits_clean.parse().map_err(|e| format!("Invalid int literal: {}", e))?;
+                Ok(Pattern::Literal(Literal::Int(val, suffix)))
             }
             TokenType::FloatLit => {
                 let t = self.advance();
-                let val = t.lexeme.parse().map_err(|e| format!("Invalid float literal: {}", e))?;
-                Ok(Pattern::Literal(Literal::Float(val)))
+                let lex = t.lexeme.clone();
+                let mut idx = None;
+                for (i, ch) in lex.chars().enumerate() {
+                    if ch.is_ascii_alphabetic() {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                let (num_part, suffix) = if let Some(i) = idx {
+                    (lex[..i].to_string(), Some(lex[i..].to_string()))
+                } else {
+                    (lex.clone(), None)
+                };
+                let num_clean: String = num_part.chars().filter(|c| *c != '_').collect();
+                let val: f64 = num_clean.parse().map_err(|e| format!("Invalid float literal: {}", e))?;
+                Ok(Pattern::Literal(Literal::Float(val, suffix)))
             }
             TokenType::StrLit => {
                 let t = self.advance();
@@ -782,7 +945,7 @@ mod tests {
                 assert!(!mutable);
                 assert_eq!(name.name, "accumulator");
                 assert_eq!(type_annotation.as_ref().unwrap().name, "Int32");
-                assert_eq!(initializer, &Expression::Literal(Literal::Int(0)));
+                assert_eq!(initializer, &Expression::Literal(Literal::Int(0, None)));
             } else {
                 panic!("expected let binding as first statement");
             }

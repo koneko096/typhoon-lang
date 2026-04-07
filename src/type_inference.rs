@@ -3,10 +3,17 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferType {
+    Int8,
+    Int16,
     Int32,
+    Int64,
+    Float16,
     Float32,
+    Float64,
     Bool,
     Str,
+    Char,
+    Byte,
     Named(String),
     Unknown(String),
 }
@@ -20,10 +27,17 @@ struct FunctionSig {
 impl InferType {
     fn from_annotation(ty: &Type) -> Self {
         match ty.name.as_str() {
+            "Int8" => InferType::Int8,
+            "Int16" => InferType::Int16,
             "Int32" => InferType::Int32,
+            "Int64" => InferType::Int64,
+            "Float16" => InferType::Float16,
             "Float32" => InferType::Float32,
+            "Float64" => InferType::Float64,
             "Bool" => InferType::Bool,
             "Str" => InferType::Str,
+            "Char" => InferType::Char,
+            "Byte" => InferType::Byte,
             other => InferType::Named(other.to_string()),
         }
     }
@@ -262,8 +276,7 @@ impl TypeChecker {
                     | Operator::Sub
                     | Operator::Mul
                     | Operator::Div
-                    | Operator::Mod
-                    | Operator::Pipe => {
+                    | Operator::Mod => {
                         if lhs == InferType::Int32 && rhs == InferType::Int32 {
                             Ok(InferType::Int32)
                         } else {
@@ -273,6 +286,37 @@ impl TypeChecker {
                                 context: format!("arithmetic binary {:?}", op),
                             })
                         }
+                    }
+                    Operator::AddAssign | Operator::SubAssign | Operator::MulAssign | Operator::DivAssign => {
+                        // compound-assign: lhs must be assignable and types must match
+                        // We only check type compatibility here
+                        if lhs == rhs {
+                            Ok(lhs)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: lhs,
+                                actual: rhs,
+                                context: format!("compound assign {:?}", op),
+                            })
+                        }
+                    }
+                    Operator::Pipe => {
+                        // pipe: left |> right  — if right is a call to a known function, ensure types align
+                        // we can't fully model generics here; accept when types match param[0] if available
+                        if let Expression::Call { func, args } = right.as_ref() {
+                            if let Expression::Identifier(id) = func.as_ref() {
+                                if let Some(sig) = self.func_sigs.get(&id.name) {
+                                    if !sig.params.is_empty() {
+                                        let first = sig.params[0].clone();
+                                        let expected = first.clone();
+                                        if lhs == expected {
+                                            return Ok(sig.ret.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(InferType::Unknown("pipe".into()))
                     }
                     Operator::Eq
                     | Operator::Ne
@@ -349,14 +393,49 @@ impl TypeChecker {
                 }
                 Ok(sig.ret.clone())
             }
+            Expression::TryOperator { expr } => {
+                // try operator: propagate inner expression's type for now
+                self.check_expression(expr)
+            }
             _ => Ok(InferType::Unknown("expr".into())),
         }
     }
 
     fn type_of_literal(&self, lit: &Literal) -> InferType {
         match lit {
-            Literal::Int(_) => InferType::Int32,
-            Literal::Float(_) => InferType::Float32,
+            Literal::Int(_val, suffix) => {
+                if let Some(s) = suffix {
+                    if s.starts_with('i') {
+                        match s.as_str() {
+                            "i8" => InferType::Int8,
+                            "i16" => InferType::Int16,
+                            "i32" => InferType::Int32,
+                            "i64" => InferType::Int64,
+                            _ => InferType::Int32,
+                        }
+                    } else if s.starts_with('u') {
+                        match s.as_str() {
+                            "u8" => InferType::Byte,
+                            _ => InferType::Named(s.clone()),
+                        }
+                    } else {
+                        InferType::Int32
+                    }
+                } else {
+                    InferType::Int32
+                }
+            }
+            Literal::Float(_val, suffix) => {
+                if let Some(s) = suffix {
+                    match s.as_str() {
+                        "f32" => InferType::Float32,
+                        "f64" => InferType::Float64,
+                        _ => InferType::Float32,
+                    }
+                } else {
+                    InferType::Float32
+                }
+            }
             Literal::Bool(_) => InferType::Bool,
             Literal::Str(_) => InferType::Str,
             Literal::Array(elems) => {
@@ -536,5 +615,33 @@ mod tests {
             },
             _ => panic!("expected type mismatch error"),
         }
+    }
+
+    #[test]
+    fn literal_suffix_types() {
+        assert!(check("fn i8f() -> Int8 { return 42i8; }").is_ok());
+        assert!(check("fn i16f() -> Int16 { return 100i16; }").is_ok());
+        assert!(check("fn i64f() -> Int64 { return 900i64; }").is_ok());
+        assert!(check("fn float64f() -> Float64 { return 3.14f64; }").is_ok());
+        assert!(check("fn bytef() -> Byte { return 255u8; }").is_ok());
+    }
+
+    #[test]
+    fn arithmetic_int32_accepts() {
+        assert!(check("fn add() -> Int32 { return 1 + 2; }").is_ok());
+    }
+
+    #[test]
+    fn arithmetic_i8_rejects() {
+        let err = check("fn addi8() -> Int8 { return 1i8 + 2i8; }").unwrap_err();
+        match err {
+            TypeError::TypeMismatch { .. } => (),
+            _ => panic!("expected type mismatch for i8 arithmetic"),
+        }
+    }
+
+    #[test]
+    fn bitwise_shift_accepts() {
+        assert!(check("fn shl() -> Int32 { return 1 << 2; }").is_ok());
     }
 }

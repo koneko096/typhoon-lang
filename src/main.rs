@@ -5,15 +5,15 @@ use std::process::Command;
 
 use typhoon_lang::codegen::Codegen;
 use typhoon_lang::lexer::Lexer;
+use typhoon_lang::liveness::LiveAnalyzer;
 use typhoon_lang::parser::Parser;
 use typhoon_lang::resolver::Resolver;
 use typhoon_lang::type_inference::TypeChecker;
-use typhoon_lang::liveness::LiveAnalyzer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: typhoon-lang <input.ty> [output]");
+        eprintln!("Usage: tpc <input.ty> [output]");
         std::process::exit(1);
     }
 
@@ -73,9 +73,9 @@ fn main() {
     }
 
     match Command::new("clang")
-        .arg(ll_path.as_os_str())
         .arg("-x")
         .arg("ir")
+        .arg(ll_path.as_os_str())
         .arg("-o")
         .arg(&output)
         .status()
