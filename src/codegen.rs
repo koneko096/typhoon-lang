@@ -23,7 +23,14 @@ impl Codegen {
         let mut builder = IrBuilder::new();
         let preamble = builder.collect_types(module);
         for decl in &module.declarations {
-            if let Declaration::Function { name, return_type, body, params, .. } = decl {
+            if let Declaration::Function {
+                name,
+                return_type,
+                body,
+                params,
+                ..
+            } = decl
+            {
                 let ret_ty = return_type
                     .as_ref()
                     .map(|ty| builder.lower_type(ty))
@@ -41,7 +48,10 @@ impl Codegen {
                 });
             }
         }
-        IrModule { functions, preamble }
+        IrModule {
+            functions,
+            preamble,
+        }
     }
 }
 
@@ -100,7 +110,12 @@ impl IrBuilder {
                     self.type_decls
                         .push(format!("%newtype.{} = type {}", name.name, alias));
                 }
-                Declaration::Function { name, return_type, params, .. } => {
+                Declaration::Function {
+                    name,
+                    return_type,
+                    params,
+                    ..
+                } => {
                     let ret_ty = return_type
                         .as_ref()
                         .map(|ty| self.lower_type(ty))
@@ -139,28 +154,53 @@ impl IrBuilder {
                 param_ty, param.name.name, param_ty, slot
             ));
             self.locals.insert(param.name.name.clone(), slot);
-            self.locals_type
-                .insert(param.name.name.clone(), param_ty);
+            self.locals_type.insert(param.name.name.clone(), param_ty);
         }
 
-        self.emit_block(body);
+        self.emit_block(body, ret_ty);
         self.finish(ret_ty)
     }
 
     fn finish(&mut self, return_type: &str) -> String {
+        // If any explicit 'ret' was already emitted in the function body,
+        // don't append a default return — avoid incorrect duplicate returns.
+        let has_ret = self
+            .lines
+            .iter()
+            .any(|l| l.trim_start().starts_with("ret ") || l.trim_start().starts_with("ret\t"));
+
         if let Some(value) = self.last_value.take() {
             if return_type != "void" {
-                self.lines.push(format!("  ret {} {}", return_type, value));
-            } else {
+                // If a ret already exists, skip appending here.
+                if !has_ret {
+                    self.lines.push(format!("  ret {} {}", return_type, value));
+                }
+            } else if !has_ret {
                 self.lines.push("  ret void".to_string());
             }
-        } else {
+        } else if !has_ret {
+            // No expression produced a value and no ret emitted; append void ret.
             self.lines.push("  ret void".to_string());
         }
+
+        // Ensure the final basic block is properly terminated. If the last line
+        // is a label (ends with ':'), append a default return so the block has
+        // a terminator. This handles cases where nested branches produced some
+        // 'ret' instructions but the fall-through path still needs a return.
+        if let Some(last) = self.lines.last() {
+            if last.trim_end().ends_with(':') {
+                if return_type != "void" {
+                    self.lines.push(format!("  ret {} 0", return_type));
+                } else {
+                    self.lines.push("  ret void".to_string());
+                }
+            }
+        }
+
         self.lines.join("\n")
     }
 
-    fn emit_block(&mut self, block: &Block) {
+    fn emit_block(&mut self, block: &Block, current_fn_ret_ty: &str) {
         for stmt in &block.statements {
             match stmt {
                 Statement::Return(Some(expr)) => {
@@ -172,42 +212,105 @@ impl IrBuilder {
                     self.last_value = None;
                     return;
                 }
-                Statement::LetBinding { name, initializer, type_annotation, .. } => {
-                    let value = self.emit_expr(initializer);
-                    let ty = type_annotation
-                        .as_ref()
-                        .map(|ty| self.lower_type(ty))
-                        .unwrap_or_else(|| "i32".to_string());
-                    let alloca = self.next_register();
-                    self.lines.push(format!("  {} = alloca {}", alloca, ty));
-                    self.lines.push(format!("  store {} {}, {}* {}", ty, value, ty, alloca));
-                    self.locals.insert(name.name.clone(), alloca);
-                    self.locals_type.insert(name.name.clone(), ty);
+                Statement::LetBinding {
+                    name,
+                    initializer,
+                    type_annotation,
+                    ..
+                } => {
+                    // Special-case array literal initializers so we allocate a stack array
+                    if let Expression::Literal(Literal::Array(elems)) = initializer {
+                        // All elements are assumed i32 for now
+                        let len = elems.len();
+                        let array_ty = format!("[{} x i32]", len);
+                        let alloca = self.next_register();
+                        self.lines
+                            .push(format!("  {} = alloca {}", alloca, array_ty));
+                        for (i, elem_expr) in elems.iter().enumerate() {
+                            let val = match elem_expr {
+                                Expression::Literal(Literal::Int(v)) => v.to_string(),
+                                _ => self.emit_expr(elem_expr),
+                            };
+                            let gep = self.next_register();
+                            self.lines.push(format!(
+                                "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
+                                gep, array_ty, array_ty, alloca, i
+                            ));
+                            self.lines
+                                .push(format!("  store i32 {}, i32* {}", val, gep));
+                        }
+                        self.locals.insert(name.name.clone(), alloca.clone());
+                        self.locals_type.insert(name.name.clone(), array_ty);
+                    } else {
+                        let value = self.emit_expr(initializer);
+                        let ty = type_annotation
+                            .as_ref()
+                            .map(|ty| self.lower_type(ty))
+                            .unwrap_or_else(|| "i32".to_string());
+                        let alloca = self.next_register();
+                        self.lines.push(format!("  {} = alloca {}", alloca, ty));
+                        self.lines
+                            .push(format!("  store {} {}, {}* {}", ty, value, ty, alloca));
+                        self.locals.insert(name.name.clone(), alloca);
+                        self.locals_type.insert(name.name.clone(), ty);
+                    }
                 }
                 Statement::Expression(expr) => {
                     let _ = self.emit_expr(expr);
                 }
-                Statement::If { condition, then_branch, else_branch } => {
+                Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
                     let cond_val = self.emit_expr(condition);
                     let then_label = self.next_block("then");
                     let else_label = self.next_block("else");
                     let merge_label = self.next_block("if_merge");
+
                     self.lines.push(format!(
                         "  br i1 {}, label %{}, label %{}",
                         cond_val, then_label, else_label
                     ));
 
+                    // ── then ─────────────────────────────────────────────────────────────
                     self.lines.push(format!("{}:", then_label));
-                    self.emit_block(then_branch);
-                    self.lines.push(format!("  br label %{}", merge_label));
-
-                    self.lines.push(format!("{}:", else_label));
-                    if let Some(stmt) = else_branch {
-                        self.emit_statement(stmt);
+                    let then_terminated =
+                        self.emit_block_terminated(then_branch, current_fn_ret_ty);
+                    if !then_terminated {
+                        self.lines.push(format!("  br label %{}", merge_label));
                     }
-                    self.lines.push(format!("  br label %{}", merge_label));
 
+                    // ── else ─────────────────────────────────────────────────────────────
+                    self.lines.push(format!("{}:", else_label));
+                    let else_terminated = match else_branch {
+                        None => {
+                            self.lines.push(format!("  br label %{}", merge_label));
+                            true
+                        }
+                        Some(ElseBranch::Block(block)) => {
+                            let t = self.emit_block_terminated(block, current_fn_ret_ty);
+                            if !t {
+                                self.lines.push(format!("  br label %{}", merge_label));
+                            }
+                            t
+                        }
+                        Some(ElseBranch::If(stmt)) => {
+                            // else if recurses — emit_statement_terminated handles If,
+                            // which will emit its own inner merge block if needed.
+                            // The outer else_label becomes the entry of the nested if.
+                            self.emit_statement_terminated(stmt, current_fn_ret_ty)
+                        }
+                    };
+
+                    // ── merge ─────────────────────────────────────────────────────────────
+                    // Always emit a merge label for consistency with tests. If both
+                    // branches already terminate, emit an 'unreachable' terminator
+                    // so the label is syntactically valid for LLVM.
                     self.lines.push(format!("{}:", merge_label));
+                    if then_terminated && else_terminated {
+                        self.lines.push("  unreachable".to_string());
+                    }
                 }
                 Statement::Match { expr, arms } => {
                     let discr = self.emit_expr(expr);
@@ -226,27 +329,155 @@ impl IrBuilder {
                     let loop_label = self.next_block("loop");
                     let loop_body = self.next_block("loop_body");
                     let loop_end = self.next_block("loop_end");
-                    self.lines.push(format!("  br label %{}", loop_label));
-                    self.lines.push(format!("{}:", loop_label));
                     match kind {
                         LoopKind::While { condition, .. } => {
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_label));
                             let cond_val = self.emit_expr(condition);
                             self.lines.push(format!(
                                 "  br i1 {}, label %{}, label %{}",
                                 cond_val, loop_body, loop_end
                             ));
+                            self.lines.push(format!("{}:", loop_body));
+                            self.emit_block(body, current_fn_ret_ty);
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_end));
+                        }
+                        LoopKind::For {
+                            pattern,
+                            iterator,
+                            body: _,
+                        } => {
+                            // Only handle simple `for x in arr` where `arr` is a local stack array `[N x i32]`
+                            if let Expression::Identifier(iter_id) = iterator {
+                                if let Some(iter_ty) = self.locals_type.get(&iter_id.name).cloned()
+                                {
+                                    if iter_ty.starts_with('[') && iter_ty.contains(" x i32") {
+                                        // parse length
+                                        if let Some(end_bracket) = iter_ty.find(']') {
+                                            // format: [N x i32]
+                                            let inside = &iter_ty[1..end_bracket];
+                                            if let Some(space_idx) = inside.find(' ') {
+                                                let len_str = &inside[..space_idx];
+                                                if let Ok(len) = len_str.parse::<usize>() {
+                                                    if let Pattern::Identifier(ident) = pattern {
+                                                        // allocate pattern slot and index slot BEFORE emitting the loop labels
+                                                        let pat_alloc = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = alloca i32",
+                                                            pat_alloc
+                                                        ));
+                                                        self.locals.insert(
+                                                            ident.name.clone(),
+                                                            pat_alloc.clone(),
+                                                        );
+                                                        self.locals_type.insert(
+                                                            ident.name.clone(),
+                                                            "i32".to_string(),
+                                                        );
+                                                        let idx_slot = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = alloca i32",
+                                                            idx_slot
+                                                        ));
+                                                        self.lines.push(format!(
+                                                            "  store i32 0, i32* {}",
+                                                            idx_slot
+                                                        ));
+                                                        let iter_alloc = self
+                                                            .locals
+                                                            .get(&iter_id.name)
+                                                            .cloned()
+                                                            .unwrap_or(iter_id.name.clone());
+                                                        // Now emit the loop control
+                                                        self.lines.push(format!(
+                                                            "  br label %{}",
+                                                            loop_label
+                                                        ));
+                                                        self.lines.push(format!("{}:", loop_label));
+                                                        let idx_val = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = load i32, i32* {}",
+                                                            idx_val, idx_slot
+                                                        ));
+                                                        let cmp = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = icmp slt i32 {}, {}",
+                                                            cmp, idx_val, len
+                                                        ));
+                                                        self.lines.push(format!(
+                                                            "  br i1 {}, label %{}, label %{}",
+                                                            cmp, loop_body, loop_end
+                                                        ));
+                                                        // Emit body label and load element for this iteration
+                                                        self.lines.push(format!("{}:", loop_body));
+                                                        let idx_val2 = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = load i32, i32* {}",
+                                                            idx_val2, idx_slot
+                                                        ));
+                                                        let gep = self.next_register();
+                                                        self.lines.push(format!("  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}", gep, iter_ty, iter_ty, iter_alloc, idx_val2));
+                                                        let elem = self.next_register();
+                                                        self.lines.push(format!(
+                                                            "  {} = load i32, i32* {}",
+                                                            elem, gep
+                                                        ));
+                                                        self.lines.push(format!(
+                                                            "  store i32 {}, i32* {}",
+                                                            elem, pat_alloc
+                                                        ));
+                                                        // Emit the loop body, detect if it terminates
+                                                        let body_terminated = self
+                                                            .emit_block_terminated(
+                                                                body,
+                                                                current_fn_ret_ty,
+                                                            );
+                                                        if !body_terminated {
+                                                            // increment idx and loop back
+                                                            let next_idx = self.next_register();
+                                                            self.lines.push(format!(
+                                                                "  {} = add i32 {}, 1",
+                                                                next_idx, idx_val2
+                                                            ));
+                                                            self.lines.push(format!(
+                                                                "  store i32 {}, i32* {}",
+                                                                next_idx, idx_slot
+                                                            ));
+                                                            self.lines.push(format!(
+                                                                "  br label %{}",
+                                                                loop_label
+                                                            ));
+                                                        }
+                                                        // Emit loop_end label (always define it so branch targets exist)
+                                                        self.lines.push(format!("{}:", loop_end));
+                                                        // Done lowering this for-loop
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Fallback: simple loop if cannot lower
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_body));
+                            self.emit_block(body, current_fn_ret_ty);
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_end));
                         }
                         _ => {
-                            self.lines.push(format!("  br label %{}", loop_body));
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_body));
+                            self.emit_block(body, current_fn_ret_ty);
+                            self.lines.push(format!("  br label %{}", loop_label));
+                            self.lines.push(format!("{}:", loop_end));
                         }
                     }
-                    self.lines.push(format!("{}:", loop_body));
-                    self.emit_block(body);
-                    self.lines.push(format!("  br label %{}", loop_label));
-                    self.lines.push(format!("{}:", loop_end));
                 }
                 Statement::Conc { body } => {
-                    self.emit_block(body);
+                    self.emit_block(body, current_fn_ret_ty);
                 }
                 _ => {}
             }
@@ -257,7 +488,123 @@ impl IrBuilder {
         }
     }
 
-    fn emit_statement(&mut self, stmt: &Statement) {
+    /// Emits a block and returns `true` if the block ended with a terminator
+    /// (ret or br), so the caller knows whether a fall-through br is needed.
+    fn emit_block_terminated(&mut self, block: &Block, ret_ty: &str) -> bool {
+        for stmt in &block.statements {
+            let terminated = self.emit_statement_terminated(stmt, ret_ty);
+            if terminated {
+                // A terminator was emitted mid-block; remaining statements
+                // would be unreachable — stop here.
+                return true;
+            }
+        }
+        false // block fell off the end with no terminator
+    }
+
+    /// Emits a single statement and returns `true` if it produced a terminator.
+    fn emit_statement_terminated(&mut self, stmt: &Statement, ret_ty: &str) -> bool {
+        match stmt {
+            Statement::Return(Some(expr)) => {
+                let value = self.emit_expr(expr);
+                self.lines.push(format!("  ret {} {}", ret_ty, value));
+                true
+            }
+            Statement::Return(None) => {
+                self.lines.push("  ret void".to_string());
+                true
+            }
+            Statement::If { condition, then_branch, else_branch } => {
+                let cond_val = self.emit_expr(condition);
+                let then_label = self.next_block("then");
+                let else_label = self.next_block("else");
+                let merge_label = self.next_block("if_merge");
+
+                self.lines.push(format!(
+                    "  br i1 {}, label %{}, label %{}",
+                    cond_val, then_label, else_label
+                ));
+
+                // then
+                self.lines.push(format!("{}:", then_label));
+                let then_terminated = self.emit_block_terminated(then_branch, ret_ty);
+                if !then_terminated {
+                    self.lines.push(format!("  br label %{}", merge_label));
+                }
+
+                // else
+                self.lines.push(format!("{}:", else_label));
+                let else_terminated = match else_branch {
+                    None => {
+                        self.lines.push(format!("  br label %{}", merge_label));
+                        true
+                    }
+                    Some(ElseBranch::Block(block)) => {
+                        let t = self.emit_block_terminated(block, ret_ty);
+                        if !t {
+                            self.lines.push(format!("  br label %{}", merge_label));
+                        }
+                        t
+                    }
+                    Some(ElseBranch::If(stmt)) => self.emit_statement_terminated(stmt, ret_ty),
+                };
+
+                // merge
+                self.lines.push(format!("{}:", merge_label));
+                if then_terminated && else_terminated {
+                    self.lines.push("  unreachable".to_string());
+                    return true;
+                }
+                false
+            }
+            Statement::Match { expr, arms } => {
+                // Simple lowering: emit each arm into its own block and branch to merge.
+                let merge_label = self.next_block("match_merge");
+                for (idx, arm) in arms.iter().enumerate() {
+                    let arm_label = self.next_block(&format!("match_arm_{}", idx));
+                    self.lines.push(format!("  br label %{}", arm_label));
+                    self.lines.push(format!("{}:", arm_label));
+                    let _ = self.emit_expr(&arm.body);
+                    self.lines.push(format!("  br label %{}", merge_label));
+                }
+                self.lines.push(format!("{}:", merge_label));
+                false
+            }
+            Statement::Loop { kind, body } => {
+                // Emit loop but assume it does not terminate the enclosing block.
+                match kind {
+                    LoopKind::While { condition, .. } => {
+                        let loop_label = self.next_block("loop");
+                        let loop_body = self.next_block("loop_body");
+                        let loop_end = self.next_block("loop_end");
+                        self.lines.push(format!("  br label %{}", loop_label));
+                        self.lines.push(format!("{}:", loop_label));
+                        let cond_val = self.emit_expr(condition);
+                        self.lines.push(format!("  br i1 {}, label %{}, label %{}", cond_val, loop_body, loop_end));
+                        self.lines.push(format!("{}:", loop_body));
+                        self.emit_block(body, ret_ty);
+                        self.lines.push(format!("  br label %{}", loop_label));
+                        self.lines.push(format!("{}:", loop_end));
+                    }
+                    LoopKind::For { .. } => {
+                        // Delegate to emit_statement (which will call emit_block)
+                        self.emit_statement(stmt, ret_ty);
+                    }
+                    _ => {
+                        self.emit_statement(stmt, ret_ty);
+                    }
+                }
+                false
+            }
+            // Delegate everything else to existing emit_statement; assume no terminator
+            other => {
+                self.emit_statement(other, ret_ty);
+                false
+            }
+        }
+    }
+
+    fn emit_statement(&mut self, stmt: &Statement, current_fn_ret_ty: &str) {
         match stmt {
             Statement::Return(Some(expr)) => {
                 let value = self.emit_expr(expr);
@@ -270,10 +617,13 @@ impl IrBuilder {
                 let _ = self.emit_expr(expr);
             }
             Statement::If { .. } | Statement::Match { .. } | Statement::Loop { .. } => {
-                self.emit_block(&Block {
-                    statements: vec![stmt.clone()],
-                    trailing_expression: None,
-                });
+                self.emit_block(
+                    &Block {
+                        statements: vec![stmt.clone()],
+                        trailing_expression: None,
+                    },
+                    current_fn_ret_ty,
+                );
             }
             _ => {}
         }
@@ -313,6 +663,20 @@ impl IrBuilder {
                     Operator::Sub => format!("  {} = sub i32 {}, {}", tmp, lhs, rhs),
                     Operator::Mul => format!("  {} = mul i32 {}, {}", tmp, lhs, rhs),
                     Operator::Div => format!("  {} = sdiv i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Mod => format!("  {} = srem i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Eq => format!("  {} = icmp eq i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Ne => format!("  {} = icmp ne i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Lt => format!("  {} = icmp slt i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Gt => format!("  {} = icmp sgt i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Le => format!("  {} = icmp sle i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Ge => format!("  {} = icmp sge i32 {}, {}", tmp, lhs, rhs),
+                    Operator::And => format!("  {} = and i1 {}, {}", tmp, lhs, rhs),
+                    Operator::Or => format!("  {} = or i1 {}, {}", tmp, lhs, rhs),
+                    Operator::BitAnd => format!("  {} = and i32 {}, {}", tmp, lhs, rhs),
+                    Operator::BitOr => format!("  {} = or i32 {}, {}", tmp, lhs, rhs),
+                    Operator::BitXor => format!("  {} = xor i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Shl => format!("  {} = shl i32 {}, {}", tmp, lhs, rhs),
+                    Operator::Shr => format!("  {} = lshr i32 {}, {}", tmp, lhs, rhs),
                     _ => format!("  {} = add i32 {}, {}", tmp, lhs, rhs),
                 };
                 self.lines.push(instr);
@@ -340,13 +704,16 @@ impl IrBuilder {
                         "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
                         gep, struct_ty, struct_ty, tmp, field_index
                     ));
-                    self.lines
-                        .push(format!("  store {} {}, {}* {}", field_type, field_value, field_type, gep));
+                    self.lines.push(format!(
+                        "  store {} {}, {}* {}",
+                        field_type, field_value, field_type, gep
+                    ));
                 }
                 tmp
             }
             Expression::MergeExpression { base, fields } => {
-                let (base_ptr, base_ty) = if let Some(Expression::Identifier(id)) = base.as_deref() {
+                let (base_ptr, base_ty) = if let Some(Expression::Identifier(id)) = base.as_deref()
+                {
                     let ptr = self
                         .locals
                         .get(&id.name)
@@ -383,22 +750,26 @@ impl IrBuilder {
                         "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
                         gep, base_ty, base_ty, base_ptr, field_index
                     ));
-                    self.lines
-                        .push(format!("  store {} {}, {}* {}", field_type, value, field_type, gep));
+                    self.lines.push(format!(
+                        "  store {} {}, {}* {}",
+                        field_type, value, field_type, gep
+                    ));
                 }
                 base_ptr
             }
             Expression::Call { func, args } => {
                 if let Expression::Identifier(id) = func.as_ref() {
-                    let (ret_ty, param_types) =
-                        match self.func_sigs.get(&id.name) {
-                            Some(sig) => sig.clone(),
-                            None => ("i32".to_string(), vec![]),
-                        };
+                    let (ret_ty, param_types) = match self.func_sigs.get(&id.name) {
+                        Some(sig) => sig.clone(),
+                        None => ("i32".to_string(), vec![]),
+                    };
                     let mut arg_pairs = Vec::new();
                     for (idx, arg) in args.iter().enumerate() {
                         let val = self.emit_expr(arg);
-                        let ty = param_types.get(idx).cloned().unwrap_or_else(|| "i32".to_string());
+                        let ty = param_types
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| "i32".to_string());
                         arg_pairs.push(format!("{} {}", ty, val));
                     }
                     let tmp = self.next_register();

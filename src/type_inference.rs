@@ -190,16 +190,39 @@ impl TypeChecker {
                 self.push_scope();
                 self.check_block(then_branch, &InferType::Unknown(String::new()))?;
                 self.pop_scope();
-                if let Some(stmt) = else_branch {
-                    self.check_statement(stmt, expected)?;
+                if let Some(ElseBranch::Block(block)) = else_branch {
+                    self.push_scope();
+                    self.check_block(block, expected)?;
+                    self.pop_scope();
                 }
                 Ok(())
             }
-            Statement::Loop { body, .. } => {
-                self.push_scope();
-                self.check_block(body, &InferType::Unknown(String::new()))?;
-                self.pop_scope();
-                Ok(())
+            Statement::Loop { kind, body } => {
+                match kind {
+                    LoopKind::For { pattern, iterator, body: _ } => {
+                        // Check iterator first and try to infer element type for pattern bindings
+                        let _ = self.check_expression(iterator)?;
+                        let elem_ty = self.infer_element_type_of_iterator(iterator);
+                        self.push_scope();
+                        self.declare_pattern_in_scope_with_type(pattern, elem_ty);
+                        self.check_block(body, &InferType::Unknown(String::new()))?;
+                        self.pop_scope();
+                        Ok(())
+                    }
+                    LoopKind::While { condition, body: _ } => {
+                        let _ = self.check_expression(condition)?;
+                        self.push_scope();
+                        self.check_block(body, &InferType::Unknown(String::new()))?;
+                        self.pop_scope();
+                        Ok(())
+                    }
+                    LoopKind::Block(block) => {
+                        self.push_scope();
+                        self.check_block(block, &InferType::Unknown(String::new()))?;
+                        self.pop_scope();
+                        Ok(())
+                    }
+                }
             }
             _ => Ok(()),
         }
@@ -247,7 +270,7 @@ impl TypeChecker {
                             Err(TypeError::TypeMismatch {
                                 expected: InferType::Int32,
                                 actual: rhs,
-                                context: "binary".to_string(),
+                                context: format!("arithmetic binary {:?}", op),
                             })
                         }
                     }
@@ -256,7 +279,43 @@ impl TypeChecker {
                     | Operator::Lt
                     | Operator::Le
                     | Operator::Gt
-                    | Operator::Ge => Ok(InferType::Bool),
+                    | Operator::Ge => {
+                        if lhs == rhs {
+                            Ok(InferType::Bool)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: lhs,
+                                actual: rhs,
+                                context: format!("comparison {:?}", op),
+                            })
+                        }
+                    }
+                    Operator::And | Operator::Or => {
+                        if lhs == InferType::Bool && rhs == InferType::Bool {
+                            Ok(InferType::Bool)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: InferType::Bool,
+                                actual: rhs,
+                                context: format!("logical {:?}", op),
+                            })
+                        }
+                    }
+                    Operator::BitAnd
+                    | Operator::BitOr
+                    | Operator::BitXor
+                    | Operator::Shl
+                    | Operator::Shr => {
+                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
+                            Ok(InferType::Int32)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: InferType::Int32,
+                                actual: rhs,
+                                context: format!("bitwise {:?}", op),
+                            })
+                        }
+                    }
                     _ => Ok(InferType::Unknown("binary".into())),
                 }
             }
@@ -300,7 +359,27 @@ impl TypeChecker {
             Literal::Float(_) => InferType::Float32,
             Literal::Bool(_) => InferType::Bool,
             Literal::Str(_) => InferType::Str,
-            Literal::Array(_) => InferType::Unknown("array".into()),
+            Literal::Array(elems) => {
+                if elems.is_empty() {
+                    return InferType::Unknown("array".into());
+                }
+                // infer element type if all literals match
+                let first_ty = match &elems[0] {
+                    Expression::Literal(l) => self.type_of_literal(l),
+                    _ => return InferType::Unknown("array".into()),
+                };
+                for e in elems.iter().skip(1) {
+                    match e {
+                        Expression::Literal(l) => {
+                            if self.type_of_literal(l) != first_ty {
+                                return InferType::Unknown("array".into());
+                            }
+                        }
+                        _ => return InferType::Unknown("array".into()),
+                    }
+                }
+                InferType::Named(format!("Array<{:?}>", first_ty))
+            }
         }
     }
 
@@ -325,6 +404,78 @@ impl TypeChecker {
             }
         }
         None
+    }
+
+    fn declare_pattern_in_scope(&mut self, pattern: &Pattern) {
+        self.declare_pattern_in_scope_with_type(pattern, None);
+    }
+
+    fn declare_pattern_in_scope_with_type(&mut self, pattern: &Pattern, ty: Option<InferType>) {
+        match pattern {
+            Pattern::Wildcard => {}
+            Pattern::Identifier(id) => {
+                let bind_ty = ty.clone().unwrap_or(InferType::Unknown("for-pat".into()));
+                self.declare(&id.name, bind_ty);
+            }
+            Pattern::Tuple(elems) | Pattern::Array(elems) => {
+                for p in elems {
+                    self.declare_pattern_in_scope_with_type(p, ty.clone());
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for (_id, p) in fields {
+                    self.declare_pattern_in_scope_with_type(p, ty.clone());
+                }
+            }
+            Pattern::Guard { pattern: p, .. } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
+            Pattern::EnumVariant { payload: Some(p), .. } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
+            _ => {}
+        }
+    }
+
+    fn infer_element_type_of_iterator(&self, iterator: &Expression) -> Option<InferType> {
+        match iterator {
+            Expression::Literal(Literal::Array(elems)) => {
+                if elems.is_empty() {
+                    return None;
+                }
+                // Infer type from first element and ensure all match
+                let first_ty = match &elems[0] {
+                    Expression::Literal(l) => self.type_of_literal(l),
+                    _ => return None,
+                };
+                for e in elems.iter().skip(1) {
+                    match e {
+                        Expression::Literal(l) => {
+                            if self.type_of_literal(l) != first_ty {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(first_ty)
+            }
+            Expression::Identifier(id) => {
+                // Try to infer element type from a declared array variable with Named(Array<...>)
+                if let Some(ty) = self.lookup(&id.name) {
+                    if let InferType::Named(name) = ty {
+                        if name.starts_with("Array<") && name.ends_with('>') {
+                            let inner = &name[6..name.len()-1];
+                            return Some(match inner {
+                                "Int32" => InferType::Int32,
+                                "Float32" => InferType::Float32,
+                                "Bool" => InferType::Bool,
+                                "Str" => InferType::Str,
+                                other => InferType::Named(other.to_string()),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 }
 
@@ -375,7 +526,8 @@ mod tests {
 
     #[test]
     fn accepts_named_types_option_result_buf() {
-        let source = "fn api() -> Result<Buf, Str> { let value: Option<Buf> = \"\"; return value; }";
+        let source =
+            "fn api() -> Result<Buf, Str> { let value: Option<Buf> = \"\"; return value; }";
         let err = check(source).unwrap_err();
         match err {
             TypeError::TypeMismatch { expected, .. } => match expected {

@@ -157,14 +157,31 @@ impl Resolver {
                 self.resolve_expression(scope, condition)?;
                 let then_scope = self.enter_scope(Some(scope));
                 self.resolve_block(then_scope, then_branch)?;
-                if let Some(stmt) = else_branch {
-                    self.resolve_statement(scope, stmt)?;
+                if let Some(ElseBranch::Block(block)) = else_branch {
+                    let else_scope = self.enter_scope(Some(scope));
+                    self.resolve_block(else_scope, block)?;
                 }
                 Ok(())
             }
-            Statement::Loop { body, .. } => {
-                let loop_scope = self.enter_scope(Some(scope));
-                self.resolve_block(loop_scope, body)
+            Statement::Loop { kind, body } => {
+                match kind {
+                    LoopKind::For { pattern, iterator, body: _ } => {
+                        // Resolve iterator in the current scope, then declare the pattern in loop scope
+                        self.resolve_expression(scope, iterator)?;
+                        let loop_scope = self.enter_scope(Some(scope));
+                        self.declare_pattern(loop_scope, pattern)?;
+                        self.resolve_block(loop_scope, body)
+                    }
+                    LoopKind::While { condition, body: _ } => {
+                        self.resolve_expression(scope, condition)?;
+                        let loop_scope = self.enter_scope(Some(scope));
+                        self.resolve_block(loop_scope, body)
+                    }
+                    LoopKind::Block(block) => {
+                        let loop_scope = self.enter_scope(Some(scope));
+                        self.resolve_block(loop_scope, block)
+                    }
+                }
             }
             _ => Ok(()),
         }
@@ -224,6 +241,38 @@ impl Resolver {
             }
         }
         None
+    }
+
+    fn declare_pattern(&mut self, scope: ScopeId, pattern: &Pattern) -> Result<(), String> {
+        match pattern {
+            Pattern::Wildcard => Ok(()),
+            Pattern::Identifier(id) => {
+                self.declare(scope, id.clone()).map(|_| ())
+            }
+            Pattern::Tuple(elems) | Pattern::Array(elems) => {
+                for p in elems {
+                    self.declare_pattern(scope, p)?;
+                }
+                Ok(())
+            }
+            Pattern::Literal(_) => Ok(()),
+            Pattern::Struct { fields, .. } => {
+                for (id, p) in fields {
+                    self.declare_pattern(scope, p)?;
+                    // Note: struct patterns may also bind the field names; that's encoded in the pattern
+                    // as Identifier patterns. The field 'id' here is the field name, not a binding.
+                }
+                Ok(())
+            }
+            Pattern::Or(a, b) => {
+                // For or-patterns, only allow bindings if both sides bind the same names.
+                // For simplicity, don't declare anything here.
+                Ok(())
+            }
+            Pattern::Guard { pattern: p, .. } => self.declare_pattern(scope, p),
+            Pattern::EnumVariant { payload: Some(p), .. } => self.declare_pattern(scope, p),
+            Pattern::EnumVariant { payload: None, .. } => Ok(()),
+        }
     }
 }
 

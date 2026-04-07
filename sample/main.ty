@@ -1,11 +1,17 @@
 namespace main
 
-fn check(one: Int32) -> Bool {
-  return (one == 1);
+fn check(even: Int32) -> Bool {
+  let ar = [2, 4, 8, 16, 32]
+  for x in ar {
+    if even % x == 0 {
+      return true;
+    }
+  }
+  return false;
 }
 
 fn main() -> Int32 {
-  if check(3) {
+  if check(5) {
     return 0;
   } else {
     return 3;

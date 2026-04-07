@@ -123,7 +123,9 @@ pub enum Statement {
     // Return statement
     Return(Option<Expression>),
     // Conc block
-    Conc { body: Block },
+    Conc {
+        body: Block,
+    },
     // Use declaration
     UseDeclaration(UsePath),
     // Loop (e.g. for, while)
@@ -135,7 +137,7 @@ pub enum Statement {
     If {
         condition: Expression,
         then_branch: Block,
-        else_branch: Option<Box<Statement>>,
+        else_branch: Option<ElseBranch>,
     },
     // Match statement
     Match {
@@ -144,6 +146,12 @@ pub enum Statement {
     },
     // Empty statement
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElseBranch {
+    Block(Block),       // else { ... }
+    If(Box<Statement>), // else if ... (where Statement is If)
 }
 
 #[derive(Debug, Clone, PartialEq)]

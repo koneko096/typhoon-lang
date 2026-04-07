@@ -152,6 +152,7 @@ impl LiveAnalyzer {
     }
 
     fn consume_identifier(&mut self, name: &Identifier, context: &str) -> Result<(), String> {
+        eprintln!("consume_identifier: {} in {}", name.name, context);
         for set in self.stack.iter_mut().rev() {
             if set.bindings.contains_key(&name.name)
                 || set.mutables.contains(&name.name)
@@ -215,15 +216,16 @@ impl LiveAnalyzer {
                 type_annotation,
                 ..
             } => {
-                self.analyze_expression(initializer)?;
+                // Initializer expressions consume any bindings they reference (move semantics for let-initializers)
+                self.consume_identifiers_in_expression(initializer)?;
                 let shared = type_annotation
                     .as_ref()
                     .map(|ty| ty.name == "ref")
                     .unwrap_or(false);
                 self.insert_binding(name, "let binding", *mutable, shared)
             }
-            Statement::Expression(expr) => self.analyze_expression(expr),
-            Statement::Return(Some(expr)) => self.analyze_expression(expr),
+            Statement::Expression(expr) => self.consume_identifiers_in_expression(expr),
+            Statement::Return(Some(expr)) => self.consume_identifiers_in_expression(expr),
             Statement::Return(None) => Ok(()),
             Statement::If {
                 condition,
@@ -233,8 +235,11 @@ impl LiveAnalyzer {
                 self.analyze_expression(condition)?;
                 let base = self.stack.clone();
                 let then_stack = self.run_branch_block(then_branch, base.clone())?;
-                let else_stack = if let Some(else_stmt) = else_branch {
-                    self.run_branch_stmt(else_stmt, base.clone())?
+                let else_stack = if let Some(eb) = else_branch {
+                    match eb {
+                        ElseBranch::Block(block) => self.run_branch_block(block, base.clone())?,
+                        ElseBranch::If(stmt) => self.run_branch_stmt(stmt, base.clone())?,
+                    }
                 } else {
                     base.clone()
                 };
@@ -268,12 +273,51 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Statement::Loop { body, .. } => {
-                let base = self.stack.clone();
-                let loop_stack = self.run_branch_block(body, base.clone())?;
-                self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
-                self.merge_branch_result(&base);
-                Ok(())
+            Statement::Loop { kind, body } => {
+                match kind {
+                    LoopKind::For {
+                        pattern,
+                        iterator,
+                        body: _,
+                    } => {
+                        // Analyze iterator first
+                        self.analyze_expression(iterator)?;
+                        let base = self.stack.clone();
+                        // Prepare a branch stack that contains the pattern binding in the top-most set
+                        let mut base_with_binding = base.clone();
+                        if let Some(top) = base_with_binding.last_mut() {
+                            // Insert bindings from pattern into the top set. Ignore duplicate errors here.
+                            let _ = (|| -> Result<(), String> {
+                                match pattern {
+                                    Pattern::Identifier(id) => {
+                                        top.insert(id, "for binding", false, false)
+                                    }
+                                    Pattern::Tuple(elems) | Pattern::Array(elems) => {
+                                        for p in elems {
+                                            if let Pattern::Identifier(id) = p {
+                                                top.insert(id, "for binding", false, false)?;
+                                            }
+                                        }
+                                        Ok(())
+                                    }
+                                    Pattern::Wildcard => Ok(()),
+                                    _ => Ok(()),
+                                }
+                            })();
+                        }
+                        let loop_stack = self.run_branch_block(body, base_with_binding)?;
+                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                        self.merge_branch_result(&base);
+                        Ok(())
+                    }
+                    _ => {
+                        let base = self.stack.clone();
+                        let loop_stack = self.run_branch_block(body, base.clone())?;
+                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                        self.merge_branch_result(&base);
+                        Ok(())
+                    }
+                }
             }
             _ => Ok(()),
         }
@@ -281,7 +325,7 @@ impl LiveAnalyzer {
 
     fn analyze_expression(&mut self, expr: &Expression) -> Result<(), String> {
         match expr {
-            Expression::Identifier(id) => self.consume_identifier(id, "expression"),
+            Expression::Identifier(_id) => Ok(()),
             Expression::Block(block) => self.analyze_block(block),
             Expression::StructInit { fields, .. } => {
                 for (_, expr) in fields {
@@ -354,6 +398,91 @@ impl LiveAnalyzer {
                 ..
             } => {
                 self.analyze_expression(expr)?;
+                let base = self.stack.clone();
+                let then_stack = self.run_branch_block(then, base.clone())?;
+                let else_stack = if let Some(else_expr) = else_branch {
+                    self.run_branch_expr(else_expr, base.clone())?
+                } else {
+                    base.clone()
+                };
+                self.ensure_branch_consistency(&base, &then_stack, &else_stack, "if let")?;
+                self.merge_branch_result(&then_stack);
+                Ok(())
+            }
+            Expression::Literal(_) => Ok(()),
+            Expression::Placeholder(_) => Ok(()),
+        }
+    }
+
+    fn consume_identifiers_in_expression(&mut self, expr: &Expression) -> Result<(), String> {
+        match expr {
+            Expression::Identifier(id) => self.consume_identifier(id, "initializer"),
+            Expression::Block(block) => self.analyze_block_no_drops(block),
+            Expression::StructInit { fields, .. } => {
+                for (_, expr) in fields {
+                    self.consume_identifiers_in_expression(expr)?;
+                }
+                Ok(())
+            }
+            Expression::Call { func, args } => {
+                if let Expression::Identifier(id) = func.as_ref() {
+                    let is_live_binding = self.stack.iter().any(|set| {
+                        set.bindings.contains_key(&id.name)
+                            || set.mutables.contains(&id.name)
+                            || set.shared.contains(&id.name)
+                    });
+                    if is_live_binding {
+                        self.consume_identifier(id, "call")?;
+                    }
+                } else {
+                    self.consume_identifiers_in_expression(func)?;
+                }
+                for arg in args {
+                    self.consume_identifiers_in_expression(arg)?;
+                }
+                Ok(())
+            }
+            Expression::BinaryOp { left, right, .. } => {
+                self.consume_identifiers_in_expression(left)?;
+                self.consume_identifiers_in_expression(right)?;
+                Ok(())
+            }
+            Expression::UnaryOp { expr, .. } => self.consume_identifiers_in_expression(expr),
+            Expression::FieldAccess { base, .. } => self.consume_identifiers_in_expression(base),
+            Expression::IndexAccess { base, index } => {
+                self.consume_identifiers_in_expression(base)?;
+                self.consume_identifiers_in_expression(index)?;
+                Ok(())
+            }
+            Expression::MergeExpression { base, fields } => {
+                if let Some(base_expr) = base {
+                    self.consume_identifiers_in_expression(base_expr)?;
+                }
+                for (_, expr) in fields {
+                    self.consume_identifiers_in_expression(expr)?;
+                }
+                Ok(())
+            }
+            Expression::Match { expr, arms } => {
+                self.consume_identifiers_in_expression(expr)?;
+                for arm in arms {
+                    self.consume_identifiers_in_expression(&arm.body)?;
+                }
+                Ok(())
+            }
+            Expression::Pipe { left, right } => {
+                self.consume_identifiers_in_expression(left)?;
+                self.consume_identifiers_in_expression(right)?;
+                Ok(())
+            }
+            Expression::TryOperator { expr } => self.consume_identifiers_in_expression(expr),
+            Expression::IfLet {
+                expr,
+                then,
+                else_branch,
+                ..
+            } => {
+                self.consume_identifiers_in_expression(expr)?;
                 let base = self.stack.clone();
                 let then_stack = self.run_branch_block(then, base.clone())?;
                 let else_stack = if let Some(else_expr) = else_branch {
@@ -568,9 +697,12 @@ mod tests {
                                 )))],
                                 trailing_expression: None,
                             },
-                            else_branch: Some(Box::new(Statement::Return(Some(
-                                Expression::Literal(Literal::Int(0)),
-                            )))),
+                            else_branch: Some(ElseBranch::Block(Block {
+                                statements: vec![Statement::Return(Some(Expression::Literal(
+                                    Literal::Int(0),
+                                )))],
+                                trailing_expression: None,
+                            })),
                         },
                     ],
                     trailing_expression: None,

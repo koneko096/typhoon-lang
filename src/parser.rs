@@ -29,7 +29,10 @@ impl Parser {
         if module_name.as_deref() != Some("main") {
             return Err("Missing 'namespace main' declaration".to_string());
         }
-        if !declarations.iter().any(|decl| matches!(decl, Declaration::Function { name, .. } if name.name == "main")) {
+        if !declarations
+            .iter()
+            .any(|decl| matches!(decl, Declaration::Function { name, .. } if name.name == "main"))
+        {
             return Err("Namespace main must define fn main".to_string());
         }
         Ok(Module {
@@ -213,86 +216,6 @@ impl Parser {
         })
     }
 
-    fn statement(&mut self) -> Result<Option<Statement>, String> {
-        let token = self.peek();
-        match token.token_type {
-            TokenType::Let => {
-                self.advance();
-                let mutable = self.match_token(TokenType::Mut);
-                let name = self.identifier()?;
-                let mut type_annotation = None;
-                if self.match_token(TokenType::Colon) {
-                    type_annotation = Some(self.parse_type()?);
-                }
-                self.consume(TokenType::Assign, "Expected '='")?;
-                let initializer = self.expression()?;
-                self.match_token(TokenType::Semicolon); // optional semicolon
-                Ok(Some(Statement::LetBinding {
-                    mutable,
-                    name,
-                    type_annotation,
-                    initializer,
-                }))
-            }
-            TokenType::Return => {
-                self.advance();
-                let mut expr = None;
-                if self.peek().token_type != TokenType::Semicolon
-                    && self.peek().token_type != TokenType::RBrace
-                {
-                    expr = Some(self.expression()?);
-                }
-                self.match_token(TokenType::Semicolon);
-                Ok(Some(Statement::Return(expr)))
-            }
-            TokenType::Conc => {
-                self.advance();
-                let body = self.block()?;
-                Ok(Some(Statement::Conc { body }))
-            }
-            TokenType::If => {
-                self.advance();
-                let condition = self.expression()?;
-                let then_branch = self.block()?;
-                let mut else_branch = None;
-                if self.match_token(TokenType::Else) {
-                    let else_block = self.block()?;
-                    else_branch = Some(Box::new(Statement::Expression(Expression::Block(else_block))));
-                }
-                Ok(Some(Statement::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                }))
-            }
-            TokenType::While => {
-                self.advance();
-                let condition = self.expression()?;
-                let body = self.block()?;
-                Ok(Some(Statement::Loop {
-                    kind: LoopKind::While {
-                        condition,
-                        body: body.clone(),
-                    },
-                    body,
-                }))
-            }
-            _ => {
-                // If it looks like an expression that ends in a semicolon, it's a statement.
-                // This is a simplification.
-                let expr = self.expression()?;
-                if self.match_token(TokenType::Semicolon) {
-                    Ok(Some(Statement::Expression(expr)))
-                } else {
-                    // Backtrack would be better, but we return None to signify it's a trailing expr
-                    // Since we can't easily backtrack the entire expression with this simple parser,
-                    // we assume that if no semicolon, it's intended to be trailing if it's the last thing.
-                    // This is fragile.
-                    Err("Expression statements must end in ';'. Trailing expressions are only allowed at block end.".to_string())
-                }
-            }
-        }
-    }
 
     fn expression(&mut self) -> Result<Expression, String> {
         self.equality()
@@ -365,6 +288,8 @@ impl Parser {
             Some(Operator::Mul)
         } else if self.match_token(TokenType::Slash) {
             Some(Operator::Div)
+        } else if self.match_token(TokenType::Modulo) {
+            Some(Operator::Mod)
         } else {
             None
         } {
@@ -427,6 +352,18 @@ impl Parser {
                 self.consume(TokenType::RParen, "Expected ')'")?;
                 Ok(expr)
             }
+            TokenType::LBracket => {
+                // Parse array literal: [ expr, expr, ... ]
+                let mut elems = Vec::new();
+                while self.peek().token_type != TokenType::RBracket {
+                    elems.push(self.expression()?);
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
+                }
+                self.consume(TokenType::RBracket, "Expected ']' after array literal")?;
+                Ok(Expression::Literal(Literal::Array(elems)))
+            }
             TokenType::LBrace => self.merge_expression(),
             _ => Err(format!("Expected expression, got {:?}", token)),
         }
@@ -478,12 +415,145 @@ impl Parser {
         Ok(Expression::MergeExpression { base, fields })
     }
 
+    fn statement(&mut self) -> Result<Option<Statement>, String> {
+        let token = self.peek();
+        match token.token_type {
+            TokenType::Let => {
+                self.advance();
+                let mutable = self.match_token(TokenType::Mut);
+                let name = self.identifier()?;
+                let mut type_annotation = None;
+                if self.match_token(TokenType::Colon) {
+                    type_annotation = Some(self.parse_type()?);
+                }
+                self.consume(TokenType::Assign, "Expected '='")?;
+                let initializer = self.expression()?;
+                self.match_token(TokenType::Semicolon); // optional semicolon
+                Ok(Some(Statement::LetBinding {
+                    mutable,
+                    name,
+                    type_annotation,
+                    initializer,
+                }))
+            }
+            TokenType::Return => {
+                self.advance();
+                let mut expr = None;
+                if self.peek().token_type != TokenType::Semicolon
+                    && self.peek().token_type != TokenType::RBrace
+                {
+                    expr = Some(self.expression()?);
+                }
+                self.match_token(TokenType::Semicolon);
+                Ok(Some(Statement::Return(expr)))
+            }
+            TokenType::Conc => {
+                self.advance();
+                let body = self.block()?;
+                Ok(Some(Statement::Conc { body }))
+            }
+            TokenType::If => {
+                self.advance();
+                let condition = self.expression()?;
+                let then_branch = self.block()?;
+                let mut else_branch = None;
+                if self.match_token(TokenType::Else) {
+                    let else_block = ElseBranch::Block(self.block()?);
+                    else_branch = Some(else_block);
+                }
+                Ok(Some(Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                }))
+            }
+            TokenType::For => {
+                self.advance();
+                let pattern = self.parse_pattern()?;
+                self.consume(TokenType::In, "Expected 'in' after for pattern")?;
+                let iterator = self.expression()?;
+                let body = self.block()?;
+                Ok(Some(Statement::Loop {
+                    kind: LoopKind::For {
+                        pattern,
+                        iterator,
+                        body: body.clone(),
+                    },
+                    body,
+                }))
+            }
+            TokenType::While => {
+                self.advance();
+                let condition = self.expression()?;
+                let body = self.block()?;
+                Ok(Some(Statement::Loop {
+                    kind: LoopKind::While {
+                        condition,
+                        body: body.clone(),
+                    },
+                    body,
+                }))
+            }
+            _ => {
+                // If it looks like an expression that ends in a semicolon, it's a statement.
+                // This is a simplification.
+                let expr = self.expression()?;
+                if self.match_token(TokenType::Semicolon) {
+                    Ok(Some(Statement::Expression(expr)))
+                } else {
+                    // Backtrack would be better, but we return None to signify it's a trailing expr
+                    // Since we can't easily backtrack the entire expression with this simple parser,
+                    // we assume that if no semicolon, it's intended to be trailing if it's the last thing.
+                    // This is fragile.
+                    Err("Expression statements must end in ';'. Trailing expressions are only allowed at block end.".to_string())
+                }
+            }
+        }
+    }
+
     fn identifier(&mut self) -> Result<Identifier, String> {
         let token = self.advance();
         if token.token_type == TokenType::Identifier {
             Ok(Identifier { name: token.lexeme })
         } else {
             Err(format!("Expected identifier, got {:?}", token))
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        let token = self.peek();
+        match token.token_type {
+            TokenType::Identifier => {
+                let id = self.identifier()?;
+                if id.name == "_" {
+                    Ok(Pattern::Wildcard)
+                } else {
+                    Ok(Pattern::Identifier(id))
+                }
+            }
+            TokenType::IntLit => {
+                let t = self.advance();
+                let val = t.lexeme.parse().map_err(|e| format!("Invalid int literal: {}", e))?;
+                Ok(Pattern::Literal(Literal::Int(val)))
+            }
+            TokenType::FloatLit => {
+                let t = self.advance();
+                let val = t.lexeme.parse().map_err(|e| format!("Invalid float literal: {}", e))?;
+                Ok(Pattern::Literal(Literal::Float(val)))
+            }
+            TokenType::StrLit => {
+                let t = self.advance();
+                Ok(Pattern::Literal(Literal::Str(t.lexeme)))
+            }
+            TokenType::True => {
+                self.advance();
+                Ok(Pattern::Literal(Literal::Bool(true)))
+            }
+            TokenType::False => {
+                self.advance();
+                Ok(Pattern::Literal(Literal::Bool(false)))
+            }
+            _ => Err(format!("Unsupported pattern start: {:?}", token)),
         }
     }
 
@@ -585,7 +655,8 @@ mod tests {
 
     #[test]
     fn test_parse_merge_expression() {
-        let source = "fn main() -> Int32 { let updated: User = { ...user, name: \"x\" }; return 0; }";
+        let source =
+            "fn main() -> Int32 { let updated: User = { ...user, name: \"x\" }; return 0; }";
         let module = parse_source(source);
         if let Declaration::Function { body, .. } = &module.declarations[0] {
             if let Statement::LetBinding { initializer, .. } = &body.statements[0] {

@@ -1,4 +1,5 @@
 # typhoon-lang
+![Test](https://github.com/koneko096/typhoon-lang/actions/actions/workflows/test.yml/badge.svg)
 
 Minimal Typhoon compiler pipeline (lexer → parser → resolver → type checker → liveness → LLVM IR).
 
