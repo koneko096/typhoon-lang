@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::span::Span;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -6,6 +7,28 @@ pub struct DeclId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub usize);
+
+#[derive(Debug, Clone)]
+pub enum DeclInfo {
+    Function,
+    Struct {
+        fields: HashMap<String, TypeKind>,
+    },
+    Enum {
+        variants: HashMap<String, EnumVariantInfo>,
+    },
+    Newtype {
+        aliased_type: TypeKind,
+    },
+    Use,
+    Unresolved,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariantInfo {
+    pub name: String,
+    pub payload: Option<EnumVariantPayloadKind>,
+}
 
 #[derive(Debug)]
 struct Scope {
@@ -15,14 +38,16 @@ struct Scope {
 
 pub struct Resolver {
     scopes: Vec<Scope>,
-    decls: Vec<String>,
+    decls: HashMap<DeclId, DeclInfo>,
+    next_decl_id: usize,
 }
 
 impl Resolver {
     pub fn new() -> Self {
         Resolver {
             scopes: Vec::new(),
-            decls: Vec::new(),
+            decls: HashMap::new(),
+            next_decl_id: 0,
         }
     }
 
@@ -60,9 +85,10 @@ impl Resolver {
         if symbols.contains_key(&identifier.name) {
             Err(format!("Duplicate declaration of '{}'", identifier.name))
         } else {
-            let decl_id = DeclId(self.decls.len());
+            let decl_id = DeclId(self.next_decl_id);
+            self.next_decl_id += 1;
             symbols.insert(identifier.name.clone(), decl_id);
-            self.decls.push(identifier.name.clone());
+            self.decls.insert(decl_id, DeclInfo::Unresolved);
             Ok(decl_id)
         }
     }
@@ -72,9 +98,13 @@ impl Resolver {
         scope: ScopeId,
         declaration: &Declaration,
     ) -> Result<(), String> {
-        match declaration {
-            Declaration::Function { params, body, return_type, .. } => {
-                // validate types used in parameters/return before resolving body
+        match &declaration.node {
+            DeclarationKind::Function {
+                params,
+                body,
+                return_type,
+                ..
+            } => {
                 for param in params {
                     if let Err(err) = self.resolve_type(scope, &param.type_annotation) {
                         return Err(err);
@@ -92,22 +122,25 @@ impl Resolver {
                 }
                 self.resolve_block(fn_scope, body)
             }
-            Declaration::Struct { fields, .. } => {
-                // Validate field types
+            DeclarationKind::Struct { fields, .. } => {
                 for (_name, ty) in fields {
                     self.resolve_type(scope, ty)?;
                 }
                 Ok(())
             }
-            Declaration::Enum { variants, .. } => {
+            DeclarationKind::Enum { variants, .. } => {
                 for variant in variants {
-                    if let Some(payload) = &variant.payload {
-                        match payload {
-                            EnumVariantPayload::Tuple(types) => {
-                                for ty in types { self.resolve_type(scope, ty)?; }
+                    if let Some(payload) = &variant.node.payload {
+                        match &payload.node {
+                            EnumVariantPayloadKind::Tuple(types) => {
+                                for ty in types {
+                                    self.resolve_type(scope, ty)?;
+                                }
                             }
-                            EnumVariantPayload::Struct(fields) => {
-                                for (_id, ty) in fields { self.resolve_type(scope, ty)?; }
+                            EnumVariantPayloadKind::Struct(fields) => {
+                                for (_id, ty) in fields {
+                                    self.resolve_type(scope, ty)?;
+                                }
                             }
                             _ => {}
                         }
@@ -115,56 +148,42 @@ impl Resolver {
                 }
                 Ok(())
             }
-            Declaration::Newtype { type_alias, .. } => {
-                self.resolve_type(scope, type_alias)
-            }
-            Declaration::Use(path) => {
-                if let Some(segment) = path.segments.last() {
-                    self.declare(
-                        scope,
-                        Identifier {
-                            name: segment.clone(),
-                        },
-                    )?;
-                }
-                Ok(())
-            }
+            DeclarationKind::Newtype { type_alias, .. } => self.resolve_type(scope, type_alias),
+            DeclarationKind::Use(_) => Ok(()),
             _ => Ok(()),
         }
     }
 
-    // Resolve type names used in annotations: allow primitives and previously-declared types.
     fn resolve_type(&self, scope: ScopeId, ty: &crate::ast::Type) -> Result<(), String> {
-        // Recurse into generics first
-        for arg in &ty.generic_args {
+        for arg in &ty.node.generic_args {
             self.resolve_type(scope, arg)?;
         }
 
-        // 'ref' is a built-in wrapper: its inner arg is already checked above.
-        if ty.name == "ref" {
-            return Ok(());
-        }
-
-        // Accept common primitive names without declaration
         let primitives = [
-            "Int8", "Int16", "Int32", "Int64", "Float16", "Float32", "Float64",
-            "Bool", "Str", "Char", "Byte",
+            "Int8", "Int16", "Int32", "Int64", "Float16", "Float32", "Float64", "Bool", "Str",
+            "Char", "Byte",
         ];
-        if primitives.contains(&ty.name.as_str()) {
+
+        let name = &ty.node.name;
+        if primitives.contains(&name.as_str()) {
             return Ok(());
         }
 
-        // Types like Option/Result/Buf/Map are treated as named generics; accept if used but warn if not declared
-        let common_named = ["Option", "Result", "Buf", "Map", "Set"];
-        if common_named.contains(&ty.name.as_str()) {
+        let common_named = ["Option", "Result", "Buf", "Map", "Set", "Node"];
+        if common_named.contains(&name.as_str()) {
             return Ok(());
         }
 
-        // Otherwise, ensure the type name resolves to a declaration in scope
-        if self.lookup(scope, &ty.name).is_some() {
+        if let Some(decl_id) = self.lookup(scope, name) {
+            if let Some(DeclInfo::Newtype { aliased_type }) = self.decls.get(&decl_id) {
+                return self.resolve_type(scope, &Spanned::new(aliased_type.clone(), ty.span));
+            }
             Ok(())
         } else {
-            Err(format!("Unknown type '{}', expected a struct/enum/newtype or builtin", ty.name))
+            Err(format!(
+                "Unknown type '{}', expected a struct/enum/newtype or builtin",
+                name
+            ))
         }
     }
 
@@ -173,22 +192,64 @@ impl Resolver {
         scope: ScopeId,
         declaration: &Declaration,
     ) -> Result<DeclId, String> {
-        match declaration {
-            Declaration::Function { name, .. }
-            | Declaration::Struct { name, .. }
-            | Declaration::Enum { name, .. }
-            | Declaration::Newtype { name, .. } => self.declare(scope, name.clone()),
-            Declaration::Use(path) => {
-                if let Some(segment) = path.segments.last() {
-                    self.declare(
+        match &declaration.node {
+            DeclarationKind::Function { name, .. } => {
+                let decl_id = self.declare(scope, name.clone())?;
+                self.decls.insert(decl_id, DeclInfo::Function);
+                Ok(decl_id)
+            }
+            DeclarationKind::Struct { name, fields, .. } => {
+                let decl_id = self.declare(scope, name.clone())?;
+                let mut field_map = HashMap::new();
+                for (field_name_id, field_type) in fields {
+                    field_map.insert(field_name_id.name.clone(), field_type.node.clone());
+                }
+                self.decls
+                    .insert(decl_id, DeclInfo::Struct { fields: field_map });
+                Ok(decl_id)
+            }
+            DeclarationKind::Enum { name, variants, .. } => {
+                let decl_id = self.declare(scope, name.clone())?;
+                let mut variant_map = HashMap::new();
+                for variant in variants {
+                    variant_map.insert(
+                        variant.node.name.name.clone(),
+                        EnumVariantInfo {
+                            name: variant.node.name.name.clone(),
+                            payload: variant.node.payload.clone().map(|p| p.node),
+                        },
+                    );
+                }
+                self.decls.insert(
+                    decl_id,
+                    DeclInfo::Enum {
+                        variants: variant_map,
+                    },
+                );
+                Ok(decl_id)
+            }
+            DeclarationKind::Newtype { name, type_alias } => {
+                let decl_id = self.declare(scope, name.clone())?;
+                self.decls.insert(
+                    decl_id,
+                    DeclInfo::Newtype {
+                        aliased_type: type_alias.node.clone(),
+                    },
+                );
+                Ok(decl_id)
+            }
+            DeclarationKind::Use(path) => {
+                for segment in &path.node.segments {
+                    let decl_id = self.declare(
                         scope,
                         Identifier {
                             name: segment.clone(),
+                            span: path.span,
                         },
-                    )
-                } else {
-                    Ok(DeclId(0))
+                    )?;
+                    self.decls.insert(decl_id, DeclInfo::Use);
                 }
+                Ok(DeclId(0))
             }
             _ => Ok(DeclId(0)),
         }
@@ -205,21 +266,28 @@ impl Resolver {
     }
 
     fn resolve_statement(&mut self, scope: ScopeId, stmt: &Statement) -> Result<(), String> {
-        match stmt {
-            Statement::LetBinding {
-                name, initializer, ..
+        match &stmt.node {
+            StatementKind::LetBinding {
+                name,
+                initializer,
+                type_annotation,
+                ..
             } => {
+                self.declare(scope, name.clone())?;
+                if let Some(ty) = type_annotation {
+                    self.resolve_type(scope, ty)?;
+                }
                 self.resolve_expression(scope, initializer)?;
-                self.declare(scope, name.clone()).map(|_| ())
+                Ok(())
             }
-            Statement::Expression(expr) => self.resolve_expression(scope, expr),
-            Statement::Return(Some(expr)) => self.resolve_expression(scope, expr),
-            Statement::Return(None) => Ok(()),
-            Statement::Conc { body } => {
+            StatementKind::Expression(expr) => self.resolve_expression(scope, expr),
+            StatementKind::Return(Some(expr)) => self.resolve_expression(scope, expr),
+            StatementKind::Return(None) => Ok(()),
+            StatementKind::Conc { body } => {
                 let conc_scope = self.enter_scope(Some(scope));
                 self.resolve_block(conc_scope, body)
             }
-            Statement::If {
+            StatementKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -227,50 +295,58 @@ impl Resolver {
                 self.resolve_expression(scope, condition)?;
                 let then_scope = self.enter_scope(Some(scope));
                 self.resolve_block(then_scope, then_branch)?;
-                if let Some(ElseBranch::Block(block)) = else_branch {
-                    let else_scope = self.enter_scope(Some(scope));
-                    self.resolve_block(else_scope, block)?;
+                if let Some(else_branch) = else_branch {
+                    match &else_branch.node {
+                        ElseBranchKind::Block(block) => {
+                            let else_scope = self.enter_scope(Some(scope));
+                            self.resolve_block(else_scope, block)?;
+                        }
+                        ElseBranchKind::If(if_stmt) => {
+                            self.resolve_statement(scope, if_stmt)?;
+                        }
+                    }
                 }
                 Ok(())
             }
-            Statement::Loop { kind, body } => {
-                match kind {
-                    LoopKind::For { pattern, iterator, body: _ } => {
-                        // Resolve iterator in the current scope, then declare the pattern in loop scope
-                        self.resolve_expression(scope, iterator)?;
-                        let loop_scope = self.enter_scope(Some(scope));
-                        self.declare_pattern(loop_scope, pattern)?;
-                        self.resolve_block(loop_scope, body)
-                    }
-                    LoopKind::While { condition, body: _ } => {
-                        self.resolve_expression(scope, condition)?;
-                        let loop_scope = self.enter_scope(Some(scope));
-                        self.resolve_block(loop_scope, body)
-                    }
-                    LoopKind::Block(block) => {
-                        let loop_scope = self.enter_scope(Some(scope));
-                        self.resolve_block(loop_scope, block)
-                    }
+            StatementKind::Loop { kind, body } => match &kind.node {
+                LoopKindKind::For {
+                    pattern,
+                    iterator,
+                    body: _,
+                } => {
+                    self.resolve_expression(scope, iterator)?;
+                    let loop_scope = self.enter_scope(Some(scope));
+                    self.declare_pattern(loop_scope, pattern)?;
+                    self.resolve_block(loop_scope, body)
                 }
-            }
+                LoopKindKind::While { condition, body: _ } => {
+                    self.resolve_expression(scope, condition)?;
+                    let loop_scope = self.enter_scope(Some(scope));
+                    self.resolve_block(loop_scope, body)
+                }
+                LoopKindKind::Block(block) => {
+                    let loop_scope = self.enter_scope(Some(scope));
+                    self.resolve_block(loop_scope, block)
+                }
+            },
             _ => Ok(()),
         }
     }
 
     fn resolve_expression(&mut self, scope: ScopeId, expr: &Expression) -> Result<(), String> {
-        match expr {
-            Expression::Identifier(id) => {
+        match &expr.node {
+            ExpressionKind::Identifier(id) => {
                 if self.lookup(scope, &id.name).is_none() {
                     Err(format!("Unresolved identifier '{}'", id.name))
                 } else {
                     Ok(())
                 }
             }
-            Expression::Block(block) => {
+            ExpressionKind::Block(block) => {
                 let block_scope = self.enter_scope(Some(scope));
                 self.resolve_block(block_scope, block)
             }
-            Expression::MergeExpression { base, fields } => {
+            ExpressionKind::MergeExpression { base, fields } => {
                 if let Some(base_expr) = base {
                     self.resolve_expression(scope, base_expr)?;
                 }
@@ -279,22 +355,31 @@ impl Resolver {
                 }
                 Ok(())
             }
-            Expression::Call { func, args } => {
-                // Resolve the callee — for plain function calls this is an Identifier,
-                // but we go through resolve_expression so method/closure calls work too.
-                // Note: top-level function names live in the root scope via declare_from_decl,
-                // so they will resolve correctly here.
+            ExpressionKind::Call { func, args } => {
                 self.resolve_expression(scope, func)?;
                 for arg in args {
                     self.resolve_expression(scope, arg)?;
                 }
                 Ok(())
             }
-            Expression::BinaryOp { left, right, .. } => {
+            ExpressionKind::BinaryOp { left, right, .. } => {
                 self.resolve_expression(scope, left)?;
                 self.resolve_expression(scope, right)
             }
-            Expression::UnaryOp { expr, .. } => self.resolve_expression(scope, expr),
+            ExpressionKind::UnaryOp { expr, .. } => self.resolve_expression(scope, expr),
+            ExpressionKind::FieldAccess { base, field } => {
+                self.resolve_expression(scope, base)?;
+                Ok(())
+            }
+            ExpressionKind::Literal(lit) => match &lit.kind {
+                LiteralKind::Array(elems) => {
+                    for elem in elems {
+                        self.resolve_expression(scope, elem)?;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
             _ => Ok(()),
         }
     }
@@ -314,34 +399,28 @@ impl Resolver {
     }
 
     fn declare_pattern(&mut self, scope: ScopeId, pattern: &Pattern) -> Result<(), String> {
-        match pattern {
-            Pattern::Wildcard => Ok(()),
-            Pattern::Identifier(id) => {
-                self.declare(scope, id.clone()).map(|_| ())
-            }
-            Pattern::Tuple(elems) | Pattern::Array(elems) => {
+        match &pattern.node {
+            PatternKind::Wildcard => Ok(()),
+            PatternKind::Identifier(id) => self.declare(scope, id.clone()).map(|_| ()),
+            PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
                 for p in elems {
                     self.declare_pattern(scope, p)?;
                 }
                 Ok(())
             }
-            Pattern::Literal(_) => Ok(()),
-            Pattern::Struct { fields, .. } => {
-                for (id, p) in fields {
+            PatternKind::Literal(_) => Ok(()),
+            PatternKind::Struct { fields, .. } => {
+                for (_id, p) in fields {
                     self.declare_pattern(scope, p)?;
-                    // Note: struct patterns may also bind the field names; that's encoded in the pattern
-                    // as Identifier patterns. The field 'id' here is the field name, not a binding.
                 }
                 Ok(())
             }
-            Pattern::Or(a, b) => {
-                // For or-patterns, only allow bindings if both sides bind the same names.
-                // For simplicity, don't declare anything here.
-                Ok(())
-            }
-            Pattern::Guard { pattern: p, .. } => self.declare_pattern(scope, p),
-            Pattern::EnumVariant { payload: Some(p), .. } => self.declare_pattern(scope, p),
-            Pattern::EnumVariant { payload: None, .. } => Ok(()),
+            PatternKind::Or(a, b) => Ok(()),
+            PatternKind::Guard { pattern: p, .. } => self.declare_pattern(scope, p),
+            PatternKind::EnumVariant {
+                payload: Some(p), ..
+            } => self.declare_pattern(scope, p),
+            PatternKind::EnumVariant { payload: None, .. } => Ok(()),
         }
     }
 }

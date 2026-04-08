@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::span::Span;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +27,7 @@ struct FunctionSig {
 
 impl InferType {
     fn from_annotation(ty: &Type) -> Self {
-        match ty.name.as_str() {
+        match ty.node.name.as_str() {
             "Int8" => InferType::Int8,
             "Int16" => InferType::Int16,
             "Int32" => InferType::Int32,
@@ -77,12 +78,12 @@ impl TypeChecker {
     fn collect_function_sigs(&mut self, module: &Module) {
         self.func_sigs.clear();
         for decl in &module.declarations {
-            if let Declaration::Function {
+            if let DeclarationKind::Function {
                 name,
                 params,
                 return_type,
                 ..
-            } = decl
+            } = &decl.node
             {
                 let ret = return_type
                     .as_ref()
@@ -104,12 +105,12 @@ impl TypeChecker {
     }
 
     fn check_declaration(&mut self, declaration: &Declaration) -> Result<(), TypeError> {
-        if let Declaration::Function {
+        if let DeclarationKind::Function {
             params,
             return_type,
             body,
             ..
-        } = declaration
+        } = &declaration.node
         {
             let expected = return_type
                 .as_ref()
@@ -151,8 +152,8 @@ impl TypeChecker {
     }
 
     fn check_statement(&mut self, stmt: &Statement, expected: &InferType) -> Result<(), TypeError> {
-        match stmt {
-            Statement::LetBinding {
+        match &stmt.node {
+            StatementKind::LetBinding {
                 name,
                 type_annotation,
                 initializer,
@@ -173,7 +174,7 @@ impl TypeChecker {
                 self.declare(&name.name, declared_ty);
                 Ok(())
             }
-            Statement::Return(Some(expr)) => {
+            StatementKind::Return(Some(expr)) => {
                 let ty = self.check_expression(expr)?;
                 if expected != &InferType::Unknown(String::new()) && expected != &ty {
                     return Err(TypeError::TypeMismatch {
@@ -184,18 +185,18 @@ impl TypeChecker {
                 }
                 Ok(())
             }
-            Statement::Return(None) => Ok(()),
-            Statement::Expression(expr) => {
+            StatementKind::Return(None) => Ok(()),
+            StatementKind::Expression(expr) => {
                 self.check_expression(expr)?;
                 Ok(())
             }
-            Statement::Conc { body } => {
+            StatementKind::Conc { body } => {
                 self.push_scope();
                 self.check_block(body, &InferType::Unknown(String::new()))?;
                 self.pop_scope();
                 Ok(())
             }
-            Statement::If {
+            StatementKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -204,52 +205,60 @@ impl TypeChecker {
                 self.push_scope();
                 self.check_block(then_branch, &InferType::Unknown(String::new()))?;
                 self.pop_scope();
-                if let Some(ElseBranch::Block(block)) = else_branch {
-                    self.push_scope();
-                    self.check_block(block, expected)?;
-                    self.pop_scope();
+                if let Some(else_branch) = else_branch {
+                    match &else_branch.node {
+                        ElseBranchKind::Block(block) => {
+                            self.push_scope();
+                            self.check_block(block, expected)?;
+                            self.pop_scope();
+                        }
+                        ElseBranchKind::If(if_stmt) => {
+                            self.check_statement(if_stmt, expected)?;
+                        }
+                    }
                 }
                 Ok(())
             }
-            Statement::Loop { kind, body } => {
-                match kind {
-                    LoopKind::For { pattern, iterator, body: _ } => {
-                        // Check iterator first and try to infer element type for pattern bindings
-                        let _ = self.check_expression(iterator)?;
-                        let elem_ty = self.infer_element_type_of_iterator(iterator);
-                        self.push_scope();
-                        self.declare_pattern_in_scope_with_type(pattern, elem_ty);
-                        self.check_block(body, &InferType::Unknown(String::new()))?;
-                        self.pop_scope();
-                        Ok(())
-                    }
-                    LoopKind::While { condition, body: _ } => {
-                        let _ = self.check_expression(condition)?;
-                        self.push_scope();
-                        self.check_block(body, &InferType::Unknown(String::new()))?;
-                        self.pop_scope();
-                        Ok(())
-                    }
-                    LoopKind::Block(block) => {
-                        self.push_scope();
-                        self.check_block(block, &InferType::Unknown(String::new()))?;
-                        self.pop_scope();
-                        Ok(())
-                    }
+            StatementKind::Loop { kind, body } => match &kind.node {
+                LoopKindKind::For {
+                    pattern,
+                    iterator,
+                    body: _,
+                } => {
+                    let _ = self.check_expression(iterator)?;
+                    let elem_ty = self.infer_element_type_of_iterator(iterator);
+                    self.push_scope();
+                    self.declare_pattern_in_scope_with_type(pattern, elem_ty);
+                    self.check_block(body, &InferType::Unknown(String::new()))?;
+                    self.pop_scope();
+                    Ok(())
                 }
-            }
+                LoopKindKind::While { condition, body: _ } => {
+                    let _ = self.check_expression(condition)?;
+                    self.push_scope();
+                    self.check_block(body, &InferType::Unknown(String::new()))?;
+                    self.pop_scope();
+                    Ok(())
+                }
+                LoopKindKind::Block(block) => {
+                    self.push_scope();
+                    self.check_block(block, &InferType::Unknown(String::new()))?;
+                    self.pop_scope();
+                    Ok(())
+                }
+            },
             _ => Ok(()),
         }
     }
 
     fn check_expression(&mut self, expr: &Expression) -> Result<InferType, TypeError> {
-        match expr {
-            Expression::Literal(lit) => Ok(self.type_of_literal(lit)),
-            Expression::Identifier(id) => self
+        match &expr.node {
+            ExpressionKind::Literal(lit) => Ok(self.type_of_literal(lit)),
+            ExpressionKind::Identifier(id) => self
                 .lookup(&id.name)
                 .cloned()
                 .ok_or(TypeError::UnknownIdentifier(id.name.clone())),
-            Expression::Block(block) => {
+            ExpressionKind::Block(block) => {
                 self.push_scope();
                 let block_ty = self.check_block(block, &InferType::Unknown(String::new()));
                 self.pop_scope();
@@ -259,7 +268,7 @@ impl TypeChecker {
                     Ok(InferType::Unknown("block".into()))
                 }
             }
-            Expression::MergeExpression { base, fields } => {
+            ExpressionKind::MergeExpression { base, fields } => {
                 if let Some(base_expr) = base {
                     self.check_expression(base_expr)?;
                 }
@@ -268,103 +277,8 @@ impl TypeChecker {
                 }
                 Ok(InferType::Unknown("merge".into()))
             }
-            Expression::BinaryOp { op, left, right } => {
-                let lhs = self.check_expression(left)?;
-                let rhs = self.check_expression(right)?;
-                match op {
-                    Operator::Add
-                    | Operator::Sub
-                    | Operator::Mul
-                    | Operator::Div
-                    | Operator::Mod => {
-                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
-                            Ok(InferType::Int32)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: InferType::Int32,
-                                actual: rhs,
-                                context: format!("arithmetic binary {:?}", op),
-                            })
-                        }
-                    }
-                    Operator::AddAssign | Operator::SubAssign | Operator::MulAssign | Operator::DivAssign => {
-                        // compound-assign: lhs must be assignable and types must match
-                        // We only check type compatibility here
-                        if lhs == rhs {
-                            Ok(lhs)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: lhs,
-                                actual: rhs,
-                                context: format!("compound assign {:?}", op),
-                            })
-                        }
-                    }
-                    Operator::Pipe => {
-                        // pipe: left |> right  — if right is a call to a known function, ensure types align
-                        // we can't fully model generics here; accept when types match param[0] if available
-                        if let Expression::Call { func, args } = right.as_ref() {
-                            if let Expression::Identifier(id) = func.as_ref() {
-                                if let Some(sig) = self.func_sigs.get(&id.name) {
-                                    if !sig.params.is_empty() {
-                                        let first = sig.params[0].clone();
-                                        let expected = first.clone();
-                                        if lhs == expected {
-                                            return Ok(sig.ret.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(InferType::Unknown("pipe".into()))
-                    }
-                    Operator::Eq
-                    | Operator::Ne
-                    | Operator::Lt
-                    | Operator::Le
-                    | Operator::Gt
-                    | Operator::Ge => {
-                        if lhs == rhs {
-                            Ok(InferType::Bool)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: lhs,
-                                actual: rhs,
-                                context: format!("comparison {:?}", op),
-                            })
-                        }
-                    }
-                    Operator::And | Operator::Or => {
-                        if lhs == InferType::Bool && rhs == InferType::Bool {
-                            Ok(InferType::Bool)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: InferType::Bool,
-                                actual: rhs,
-                                context: format!("logical {:?}", op),
-                            })
-                        }
-                    }
-                    Operator::BitAnd
-                    | Operator::BitOr
-                    | Operator::BitXor
-                    | Operator::Shl
-                    | Operator::Shr => {
-                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
-                            Ok(InferType::Int32)
-                        } else {
-                            Err(TypeError::TypeMismatch {
-                                expected: InferType::Int32,
-                                actual: rhs,
-                                context: format!("bitwise {:?}", op),
-                            })
-                        }
-                    }
-                    _ => Ok(InferType::Unknown("binary".into())),
-                }
-            }
-            Expression::Call { func, args } => {
-                let func_name = if let Expression::Identifier(id) = func.as_ref() {
+            ExpressionKind::Call { func, args } => {
+                let func_name = if let ExpressionKind::Identifier(id) = &func.node {
                     id.name.clone()
                 } else {
                     return Err(TypeError::UnknownIdentifier("call".into()));
@@ -393,39 +307,61 @@ impl TypeChecker {
                 }
                 Ok(sig.ret.clone())
             }
-            Expression::TryOperator { expr } => {
-                // try operator: propagate inner expression's type for now
-                self.check_expression(expr)
+            ExpressionKind::TryOperator { expr } => self.check_expression(expr),
+            ExpressionKind::BinaryOp { op, left, right } => {
+                let lhs = self.check_expression(left)?;
+                let rhs = self.check_expression(right)?;
+                match op {
+                    Operator::Add
+                    | Operator::Sub
+                    | Operator::Mul
+                    | Operator::Div
+                    | Operator::Mod => {
+                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
+                            Ok(InferType::Int32)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: InferType::Int32,
+                                actual: rhs,
+                                context: format!("arithmetic binary {:?}", op),
+                            })
+                        }
+                    }
+                    Operator::Shl | Operator::Shr => {
+                        if lhs == InferType::Int32 && rhs == InferType::Int32 {
+                            Ok(InferType::Int32)
+                        } else {
+                            Err(TypeError::TypeMismatch {
+                                expected: InferType::Int32,
+                                actual: rhs,
+                                context: format!("shift binary {:?}", op),
+                            })
+                        }
+                    }
+                    _ => Ok(InferType::Unknown("binary".into())),
+                }
             }
             _ => Ok(InferType::Unknown("expr".into())),
         }
     }
 
     fn type_of_literal(&self, lit: &Literal) -> InferType {
-        match lit {
-            Literal::Int(_val, suffix) => {
+        match &lit.kind {
+            LiteralKind::Int(_val, suffix) => {
                 if let Some(s) = suffix {
-                    if s.starts_with('i') {
-                        match s.as_str() {
-                            "i8" => InferType::Int8,
-                            "i16" => InferType::Int16,
-                            "i32" => InferType::Int32,
-                            "i64" => InferType::Int64,
-                            _ => InferType::Int32,
-                        }
-                    } else if s.starts_with('u') {
-                        match s.as_str() {
-                            "u8" => InferType::Byte,
-                            _ => InferType::Named(s.clone()),
-                        }
-                    } else {
-                        InferType::Int32
+                    match s.as_str() {
+                        "i8" => InferType::Int8,
+                        "i16" => InferType::Int16,
+                        "i32" => InferType::Int32,
+                        "i64" => InferType::Int64,
+                        "u8" => InferType::Byte,
+                        _ => InferType::Int32,
                     }
                 } else {
                     InferType::Int32
                 }
             }
-            Literal::Float(_val, suffix) => {
+            LiteralKind::Float(_val, suffix) => {
                 if let Some(s) = suffix {
                     match s.as_str() {
                         "f32" => InferType::Float32,
@@ -436,20 +372,19 @@ impl TypeChecker {
                     InferType::Float32
                 }
             }
-            Literal::Bool(_) => InferType::Bool,
-            Literal::Str(_) => InferType::Str,
-            Literal::Array(elems) => {
+            LiteralKind::Bool(_) => InferType::Bool,
+            LiteralKind::Str(_) => InferType::Str,
+            LiteralKind::Array(elems) => {
                 if elems.is_empty() {
                     return InferType::Unknown("array".into());
                 }
-                // infer element type if all literals match
-                let first_ty = match &elems[0] {
-                    Expression::Literal(l) => self.type_of_literal(l),
+                let first_ty = match &elems[0].node {
+                    ExpressionKind::Literal(l) => self.type_of_literal(l),
                     _ => return InferType::Unknown("array".into()),
                 };
                 for e in elems.iter().skip(1) {
-                    match e {
-                        Expression::Literal(l) => {
+                    match &e.node {
+                        ExpressionKind::Literal(l) => {
                             if self.type_of_literal(l) != first_ty {
                                 return InferType::Unknown("array".into());
                             }
@@ -485,47 +420,49 @@ impl TypeChecker {
         None
     }
 
-    fn declare_pattern_in_scope(&mut self, pattern: &Pattern) {
-        self.declare_pattern_in_scope_with_type(pattern, None);
-    }
-
     fn declare_pattern_in_scope_with_type(&mut self, pattern: &Pattern, ty: Option<InferType>) {
-        match pattern {
-            Pattern::Wildcard => {}
-            Pattern::Identifier(id) => {
+        match &pattern.node {
+            PatternKind::Wildcard => {}
+            PatternKind::Identifier(id) => {
                 let bind_ty = ty.clone().unwrap_or(InferType::Unknown("for-pat".into()));
                 self.declare(&id.name, bind_ty);
             }
-            Pattern::Tuple(elems) | Pattern::Array(elems) => {
+            PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
                 for p in elems {
                     self.declare_pattern_in_scope_with_type(p, ty.clone());
                 }
             }
-            Pattern::Struct { fields, .. } => {
+            PatternKind::Struct { fields, .. } => {
                 for (_id, p) in fields {
                     self.declare_pattern_in_scope_with_type(p, ty.clone());
                 }
             }
-            Pattern::Guard { pattern: p, .. } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
-            Pattern::EnumVariant { payload: Some(p), .. } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
+            PatternKind::Guard { pattern: p, .. } => {
+                self.declare_pattern_in_scope_with_type(p, ty.clone())
+            }
+            PatternKind::EnumVariant {
+                payload: Some(p), ..
+            } => self.declare_pattern_in_scope_with_type(p, ty.clone()),
             _ => {}
         }
     }
 
     fn infer_element_type_of_iterator(&self, iterator: &Expression) -> Option<InferType> {
-        match iterator {
-            Expression::Literal(Literal::Array(elems)) => {
+        match &iterator.node {
+            ExpressionKind::Literal(Literal {
+                kind: LiteralKind::Array(elems),
+                ..
+            }) => {
                 if elems.is_empty() {
                     return None;
                 }
-                // Infer type from first element and ensure all match
-                let first_ty = match &elems[0] {
-                    Expression::Literal(l) => self.type_of_literal(l),
+                let first_ty = match &elems[0].node {
+                    ExpressionKind::Literal(l) => self.type_of_literal(l),
                     _ => return None,
                 };
                 for e in elems.iter().skip(1) {
-                    match e {
-                        Expression::Literal(l) => {
+                    match &e.node {
+                        ExpressionKind::Literal(l) => {
                             if self.type_of_literal(l) != first_ty {
                                 return None;
                             }
@@ -535,12 +472,11 @@ impl TypeChecker {
                 }
                 Some(first_ty)
             }
-            Expression::Identifier(id) => {
-                // Try to infer element type from a declared array variable with Named(Array<...>)
+            ExpressionKind::Identifier(id) => {
                 if let Some(ty) = self.lookup(&id.name) {
                     if let InferType::Named(name) = ty {
                         if name.starts_with("Array<") && name.ends_with('>') {
-                            let inner = &name[6..name.len()-1];
+                            let inner = &name[6..name.len() - 1];
                             return Some(match inner {
                                 "Int32" => InferType::Int32,
                                 "Float32" => InferType::Float32,

@@ -1,10 +1,12 @@
 use crate::ast::*;
+use crate::span::Span;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 struct LiveBinding {
     consumed: bool,
     origin: String,
+    span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,7 @@ impl LiveSet {
                 LiveBinding {
                     consumed: false,
                     origin: origin.to_string(),
+                    span: name.span,
                 },
             );
             Ok(())
@@ -59,7 +62,12 @@ impl LiveSet {
         }
         if let Some(binding) = self.bindings.get_mut(name) {
             if binding.consumed {
-                Err(format!("Binding '{}' already consumed ({})", name, context))
+                Err(format!(
+                    "Binding '{}' already consumed ({}) [span {}]",
+                    name,
+                    context,
+                    format_span(binding.span)
+                ))
             } else {
                 binding.consumed = true;
                 Ok(())
@@ -69,12 +77,12 @@ impl LiveSet {
         }
     }
 
-    fn unconsumed(&self) -> Vec<(String, String)> {
+    fn unconsumed(&self) -> Vec<(String, String, Span)> {
         self.bindings
             .iter()
             .filter_map(|(name, binding)| {
                 if !binding.consumed {
-                    Some((name.clone(), binding.origin.clone()))
+                    Some((name.clone(), binding.origin.clone(), binding.span))
                 } else {
                     None
                 }
@@ -100,10 +108,10 @@ impl LiveAnalyzer {
 
     pub fn analyze_module(&mut self, module: &Module) -> Result<(), Vec<String>> {
         for decl in &module.declarations {
-            if let Declaration::Function { params, body, .. } = decl {
+            if let DeclarationKind::Function { params, body, .. } = &decl.node {
                 self.push();
                 for param in params {
-                    let shared = param.type_annotation.name == "ref";
+                    let shared = is_ref_type(&param.type_annotation);
                     if let Err(err) = self.insert_binding(&param.name, "parameter", false, shared) {
                         self.errors.push(err);
                         break;
@@ -152,7 +160,6 @@ impl LiveAnalyzer {
     }
 
     fn consume_identifier(&mut self, name: &Identifier, context: &str) -> Result<(), String> {
-        eprintln!("consume_identifier: {} in {}", name.name, context);
         for set in self.stack.iter_mut().rev() {
             if set.bindings.contains_key(&name.name)
                 || set.mutables.contains(&name.name)
@@ -162,8 +169,10 @@ impl LiveAnalyzer {
             }
         }
         Err(format!(
-            "Binding '{}' not found while {}",
-            name.name, context
+            "Binding '{}' not found while {} (span {})",
+            name.name,
+            context,
+            format_span(name.span)
         ))
     }
 
@@ -199,17 +208,12 @@ impl LiveAnalyzer {
     }
 
     fn analyze_statement_no_drops(&mut self, stmt: &Statement) -> Result<(), String> {
-        match stmt {
-            Statement::If { .. } | Statement::Match { .. } | Statement::Loop { .. } => {
-                self.analyze_statement(stmt)
-            }
-            _ => self.analyze_statement(stmt),
-        }
+        self.analyze_statement(stmt)
     }
 
     fn analyze_statement(&mut self, stmt: &Statement) -> Result<(), String> {
-        match stmt {
-            Statement::LetBinding {
+        match &stmt.node {
+            StatementKind::LetBinding {
                 name,
                 initializer,
                 mutable,
@@ -220,14 +224,14 @@ impl LiveAnalyzer {
                 self.consume_identifiers_in_expression(initializer)?;
                 let shared = type_annotation
                     .as_ref()
-                    .map(|ty| ty.name == "ref")
+                    .map(|ty| is_ref_type(ty))
                     .unwrap_or(false);
                 self.insert_binding(name, "let binding", *mutable, shared)
             }
-            Statement::Expression(expr) => self.consume_identifiers_in_expression(expr),
-            Statement::Return(Some(expr)) => self.consume_identifiers_in_expression(expr),
-            Statement::Return(None) => Ok(()),
-            Statement::If {
+            StatementKind::Expression(expr) => self.consume_identifiers_in_expression(expr),
+            StatementKind::Return(Some(expr)) => self.consume_identifiers_in_expression(expr),
+            StatementKind::Return(None) => Ok(()),
+            StatementKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -236,9 +240,11 @@ impl LiveAnalyzer {
                 let base = self.stack.clone();
                 let then_stack = self.run_branch_block(then_branch, base.clone())?;
                 let else_stack = if let Some(eb) = else_branch {
-                    match eb {
-                        ElseBranch::Block(block) => self.run_branch_block(block, base.clone())?,
-                        ElseBranch::If(stmt) => self.run_branch_stmt(stmt, base.clone())?,
+                    match &eb.node {
+                        ElseBranchKind::Block(block) => {
+                            self.run_branch_block(block, base.clone())?
+                        }
+                        ElseBranchKind::If(stmt) => self.run_branch_stmt(stmt, base.clone())?,
                     }
                 } else {
                     base.clone()
@@ -247,17 +253,37 @@ impl LiveAnalyzer {
                 self.merge_branch_result(&then_stack);
                 Ok(())
             }
-            Statement::Conc { body } => {
+            StatementKind::Conc { body } => {
                 let base = self.stack.clone();
                 let conc_stack = self.run_branch_block(body, base)?;
                 self.merge_branch_result(&conc_stack);
                 Ok(())
             }
-            Statement::Match { arms, .. } => {
+            StatementKind::Loop { kind, body } => {
+                let base = self.stack.clone();
+                match &kind.node {
+                    LoopKindKind::For {
+                        pattern, iterator, ..
+                    } => {
+                        self.analyze_expression(iterator)?;
+                        self.analyze_pattern(pattern)?;
+                    }
+                    LoopKindKind::While { condition, .. } => {
+                        self.analyze_expression(condition)?;
+                    }
+                    _ => {}
+                }
+                let loop_stack = self.run_branch_block(body, base.clone())?;
+                self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                self.merge_branch_result(&loop_stack);
+                Ok(())
+            }
+            StatementKind::Match { expr, arms } => {
+                self.analyze_expression(expr)?;
                 let base = self.stack.clone();
                 let mut branch_results = Vec::new();
                 for arm in arms {
-                    let stack = self.run_branch_expr(&arm.body, base.clone())?;
+                    let stack = self.run_branch_expr(&arm.node.body, base.clone())?;
                     branch_results.push(stack);
                 }
                 if let Some(first) = branch_results.first() {
@@ -273,72 +299,26 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Statement::Loop { kind, body } => {
-                match kind {
-                    LoopKind::For {
-                        pattern,
-                        iterator,
-                        body: _,
-                    } => {
-                        // Analyze iterator first
-                        self.analyze_expression(iterator)?;
-                        let base = self.stack.clone();
-                        // Prepare a branch stack that contains the pattern binding in the top-most set
-                        let mut base_with_binding = base.clone();
-                        if let Some(top) = base_with_binding.last_mut() {
-                            // Insert bindings from pattern into the top set. Ignore duplicate errors here.
-                            let _ = (|| -> Result<(), String> {
-                                match pattern {
-                                    Pattern::Identifier(id) => {
-                                        top.insert(id, "for binding", false, false)
-                                    }
-                                    Pattern::Tuple(elems) | Pattern::Array(elems) => {
-                                        for p in elems {
-                                            if let Pattern::Identifier(id) = p {
-                                                top.insert(id, "for binding", false, false)?;
-                                            }
-                                        }
-                                        Ok(())
-                                    }
-                                    Pattern::Wildcard => Ok(()),
-                                    _ => Ok(()),
-                                }
-                            })();
-                        }
-                        let loop_stack = self.run_branch_block(body, base_with_binding)?;
-                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
-                        self.merge_branch_result(&base);
-                        Ok(())
-                    }
-                    _ => {
-                        let base = self.stack.clone();
-                        let loop_stack = self.run_branch_block(body, base.clone())?;
-                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
-                        self.merge_branch_result(&base);
-                        Ok(())
-                    }
-                }
-            }
-            _ => Ok(()),
+            _ => Err("Unsupported statement type".to_string()),
         }
     }
 
     fn analyze_expression(&mut self, expr: &Expression) -> Result<(), String> {
-        match expr {
-            Expression::Identifier(_id) => Ok(()),
-            Expression::Block(block) => self.analyze_block(block),
-            Expression::StructInit { fields, .. } => {
+        match &expr.node {
+            ExpressionKind::Identifier(_id) => Ok(()),
+            ExpressionKind::Block(block) => self.analyze_block(block),
+            ExpressionKind::StructInit { fields, .. } => {
                 for (_, expr) in fields {
                     self.analyze_expression(expr)?;
                 }
                 Ok(())
             }
-            Expression::Call { func, args } => {
+            ExpressionKind::Call { func, args } => {
                 // If the callee is a plain identifier, only consume it as a live binding
                 // if it actually exists in the live set (i.e. it's a closure / callable
                 // stored in a local variable). Top-level function names are never inserted
                 // into the live set, so we skip them silently rather than erroring.
-                if let Expression::Identifier(id) = func.as_ref() {
+                if let ExpressionKind::Identifier(id) = &func.node {
                     let is_live_binding = self.stack.iter().any(|set| {
                         set.bindings.contains_key(&id.name)
                             || set.mutables.contains(&id.name)
@@ -357,19 +337,19 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Expression::BinaryOp { left, right, .. } => {
+            ExpressionKind::BinaryOp { left, right, .. } => {
                 self.analyze_expression(left)?;
                 self.analyze_expression(right)?;
                 Ok(())
             }
-            Expression::UnaryOp { expr, .. } => self.analyze_expression(expr),
-            Expression::FieldAccess { base, .. } => self.analyze_expression(base),
-            Expression::IndexAccess { base, index } => {
+            ExpressionKind::UnaryOp { expr, .. } => self.analyze_expression(expr),
+            ExpressionKind::FieldAccess { base, .. } => self.analyze_expression(base),
+            ExpressionKind::IndexAccess { base, index } => {
                 self.analyze_expression(base)?;
                 self.analyze_expression(index)?;
                 Ok(())
             }
-            Expression::MergeExpression { base, fields } => {
+            ExpressionKind::MergeExpression { base, fields } => {
                 if let Some(base_expr) = base {
                     self.analyze_expression(base_expr)?;
                 }
@@ -378,20 +358,20 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Expression::Match { expr, arms } => {
+            ExpressionKind::Match { expr, arms } => {
                 self.analyze_expression(expr)?;
                 for arm in arms {
-                    self.analyze_expression(&arm.body)?;
+                    self.analyze_expression(&arm.node.body)?;
                 }
                 Ok(())
             }
-            Expression::Pipe { left, right } => {
+            ExpressionKind::Pipe { left, right } => {
                 self.analyze_expression(left)?;
                 self.analyze_expression(right)?;
                 Ok(())
             }
-            Expression::TryOperator { expr } => self.analyze_expression(expr),
-            Expression::IfLet {
+            ExpressionKind::TryOperator { expr } => self.analyze_expression(expr),
+            ExpressionKind::IfLet {
                 expr,
                 then,
                 else_branch,
@@ -409,23 +389,23 @@ impl LiveAnalyzer {
                 self.merge_branch_result(&then_stack);
                 Ok(())
             }
-            Expression::Literal(_) => Ok(()),
-            Expression::Placeholder(_) => Ok(()),
+            ExpressionKind::Literal(_) => Ok(()),
+            ExpressionKind::Placeholder(_) => Ok(()),
         }
     }
 
     fn consume_identifiers_in_expression(&mut self, expr: &Expression) -> Result<(), String> {
-        match expr {
-            Expression::Identifier(id) => self.consume_identifier(id, "initializer"),
-            Expression::Block(block) => self.analyze_block_no_drops(block),
-            Expression::StructInit { fields, .. } => {
+        match &expr.node {
+            ExpressionKind::Identifier(id) => self.consume_identifier(id, "initializer"),
+            ExpressionKind::Block(block) => self.analyze_block_no_drops(block),
+            ExpressionKind::StructInit { fields, .. } => {
                 for (_, expr) in fields {
                     self.consume_identifiers_in_expression(expr)?;
                 }
                 Ok(())
             }
-            Expression::Call { func, args } => {
-                if let Expression::Identifier(id) = func.as_ref() {
+            ExpressionKind::Call { func, args } => {
+                if let ExpressionKind::Identifier(id) = &func.node {
                     let is_live_binding = self.stack.iter().any(|set| {
                         set.bindings.contains_key(&id.name)
                             || set.mutables.contains(&id.name)
@@ -442,19 +422,21 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Expression::BinaryOp { left, right, .. } => {
+            ExpressionKind::BinaryOp { left, right, .. } => {
                 self.consume_identifiers_in_expression(left)?;
                 self.consume_identifiers_in_expression(right)?;
                 Ok(())
             }
-            Expression::UnaryOp { expr, .. } => self.consume_identifiers_in_expression(expr),
-            Expression::FieldAccess { base, .. } => self.consume_identifiers_in_expression(base),
-            Expression::IndexAccess { base, index } => {
+            ExpressionKind::UnaryOp { expr, .. } => self.consume_identifiers_in_expression(expr),
+            ExpressionKind::FieldAccess { base, .. } => {
+                self.consume_identifiers_in_expression(base)
+            }
+            ExpressionKind::IndexAccess { base, index } => {
                 self.consume_identifiers_in_expression(base)?;
                 self.consume_identifiers_in_expression(index)?;
                 Ok(())
             }
-            Expression::MergeExpression { base, fields } => {
+            ExpressionKind::MergeExpression { base, fields } => {
                 if let Some(base_expr) = base {
                     self.consume_identifiers_in_expression(base_expr)?;
                 }
@@ -463,20 +445,20 @@ impl LiveAnalyzer {
                 }
                 Ok(())
             }
-            Expression::Match { expr, arms } => {
+            ExpressionKind::Match { expr, arms } => {
                 self.consume_identifiers_in_expression(expr)?;
                 for arm in arms {
-                    self.consume_identifiers_in_expression(&arm.body)?;
+                    self.consume_identifiers_in_expression(&arm.node.body)?;
                 }
                 Ok(())
             }
-            Expression::Pipe { left, right } => {
+            ExpressionKind::Pipe { left, right } => {
                 self.consume_identifiers_in_expression(left)?;
                 self.consume_identifiers_in_expression(right)?;
                 Ok(())
             }
-            Expression::TryOperator { expr } => self.consume_identifiers_in_expression(expr),
-            Expression::IfLet {
+            ExpressionKind::TryOperator { expr } => self.consume_identifiers_in_expression(expr),
+            ExpressionKind::IfLet {
                 expr,
                 then,
                 else_branch,
@@ -494,8 +476,8 @@ impl LiveAnalyzer {
                 self.merge_branch_result(&then_stack);
                 Ok(())
             }
-            Expression::Literal(_) => Ok(()),
-            Expression::Placeholder(_) => Ok(()),
+            ExpressionKind::Literal(_) => Ok(()),
+            ExpressionKind::Placeholder(_) => Ok(()),
         }
     }
 
@@ -588,11 +570,29 @@ impl LiveAnalyzer {
     }
 
     fn record_drops(&mut self, set: &LiveSet) {
-        for (name, origin) in set.unconsumed() {
-            self.drops
-                .push(format!("Drop '{}' (origin: {})", name, origin));
+        for (name, origin, span) in set.unconsumed() {
+            self.drops.push(format!(
+                "Drop '{}' (origin: {}; span: {})",
+                name,
+                origin,
+                format_span(span)
+            ));
         }
     }
+
+    fn analyze_pattern(&mut self, _pattern: &Pattern) -> Result<(), String> {
+        // Patterns in for-loop bindings introduce new variables into scope;
+        // for now we accept all patterns without tracking their introduced names.
+        Ok(())
+    }
+}
+
+fn format_span(span: Span) -> String {
+    format!("{}:{} ({}..{})", span.line, span.col, span.start, span.end)
+}
+
+fn is_ref_type(ty: &Type) -> bool {
+    ty.node.name.eq("ref")
 }
 
 #[cfg(test)]
@@ -600,6 +600,60 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+    use crate::span::Span;
+
+    fn dummy_span() -> Span {
+        Span::new(0, 0, 0, 0)
+    }
+
+    fn mk_ident(name: &str) -> Identifier {
+        Identifier {
+            name: name.into(),
+            span: dummy_span(),
+        }
+    }
+
+    fn mk_stmt(kind: StatementKind) -> Statement {
+        Spanned::new(kind, dummy_span())
+    }
+
+    fn mk_expr(kind: ExpressionKind) -> Expression {
+        Spanned::new(kind, dummy_span())
+    }
+
+    fn mk_type(name: &str) -> Type {
+        Spanned::new(
+            TypeKind {
+                name: name.into(),
+                generic_args: vec![],
+            },
+            dummy_span(),
+        )
+    }
+
+    fn mk_param(name: &str, ty: &str) -> Parameter {
+        Parameter {
+            name: mk_ident(name),
+            type_annotation: mk_type(ty),
+            span: dummy_span(),
+        }
+    }
+
+    fn mk_decl(kind: DeclarationKind) -> Declaration {
+        Spanned::new(kind, dummy_span())
+    }
+
+    fn mk_else(kind: ElseBranchKind) -> ElseBranch {
+        Spanned::new(kind, dummy_span())
+    }
+
+    fn mk_block(statements: Vec<Statement>) -> Block {
+        Block {
+            statements,
+            trailing_expression: None,
+            span: dummy_span(),
+        }
+    }
 
     fn normalize_source(source: &str) -> String {
         let mut body = source.trim().to_string();
@@ -654,60 +708,38 @@ mod tests {
     fn conditional_consumption_mismatch() {
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "cond".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("cond"),
                 generics: vec![],
-                params: vec![Parameter {
-                    name: Identifier {
-                        name: "flag".into(),
-                    },
-                    type_annotation: Type {
-                        name: "Bool".into(),
-                        generic_args: vec![],
-                    },
-                }],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
-                body: Block {
-                    statements: vec![
-                        Statement::LetBinding {
-                            mutable: false,
-                            name: Identifier {
-                                name: "value".into(),
-                            },
-                            type_annotation: Some(Type {
-                                name: "Int32".into(),
-                                generic_args: vec![],
-                            }),
-                            initializer: Expression::Literal(Literal::Int(1, None)),
-                        },
-                        Statement::If {
-                            condition: Expression::Identifier(Identifier {
-                                name: "flag".into(),
-                            }),
-                            then_branch: Block {
-                                statements: vec![Statement::Return(Some(Expression::Identifier(
-                                    Identifier {
-                                        name: "value".into(),
-                                    },
-                                )))],
-                                trailing_expression: None,
-                            },
-                            else_branch: Some(ElseBranch::Block(Block {
-                                statements: vec![Statement::Return(Some(Expression::Literal(
-                                    Literal::Int(0, None),
-                                )))],
-                                trailing_expression: None,
-                            })),
-                        },
-                    ],
-                    trailing_expression: None,
-                },
-            }],
+                params: vec![mk_param("flag", "Bool")],
+                return_type: Some(mk_type("Int32")),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        name: mk_ident("value"),
+                        type_annotation: Some(mk_type("Int32")),
+                        initializer: mk_expr(ExpressionKind::Literal(Literal {
+                            kind: LiteralKind::Int(1, None),
+                            span: dummy_span(),
+                        })),
+                    }),
+                    mk_stmt(StatementKind::If {
+                        condition: mk_expr(ExpressionKind::Identifier(mk_ident("flag"))),
+                        then_branch: mk_block(vec![mk_stmt(StatementKind::Return(Some(mk_expr(
+                            ExpressionKind::Identifier(mk_ident("value")),
+                        ))))]),
+                        else_branch: Some(mk_else(ElseBranchKind::Block(mk_block(vec![mk_stmt(
+                            StatementKind::Return(Some(mk_expr(ExpressionKind::Literal(
+                                Literal {
+                                    kind: LiteralKind::Int(0, None),
+                                    span: dummy_span(),
+                                },
+                            )))),
+                        )])))),
+                    }),
+                ]),
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();
@@ -719,43 +751,31 @@ mod tests {
 
     #[test]
     fn loop_consumption_rejected() {
-        let loop_body = Block {
-            statements: vec![Statement::Return(Some(Expression::Identifier(
-                Identifier {
-                    name: "token".into(),
-                },
-            )))],
-            trailing_expression: None,
-        };
+        let loop_body = mk_block(vec![mk_stmt(StatementKind::Return(Some(mk_expr(
+            ExpressionKind::Identifier(mk_ident("token")),
+        ))))]);
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "looping".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("looping"),
                 generics: vec![],
-                params: vec![Parameter {
-                    name: Identifier {
-                        name: "token".into(),
-                    },
-                    type_annotation: Type {
-                        name: "Int32".into(),
-                        generic_args: vec![],
-                    },
-                }],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
+                params: vec![mk_param("token", "Int32")],
+                return_type: Some(mk_type("Int32")),
                 body: Block {
-                    statements: vec![Statement::Loop {
-                        kind: LoopKind::Block(loop_body.clone()),
+                    statements: vec![mk_stmt(StatementKind::Loop {
+                        kind: Spanned::new(LoopKindKind::Block(loop_body.clone()), dummy_span()),
                         body: loop_body,
-                    }],
-                    trailing_expression: Some(Box::new(Expression::Literal(Literal::Int(0, None)))),
-
+                    })],
+                    trailing_expression: Some(Box::new(mk_expr(ExpressionKind::Literal(
+                        Literal {
+                            kind: LiteralKind::Int(0, None),
+                            span: dummy_span(),
+                        },
+                    )))),
+                    span: dummy_span(),
                 },
-            }],
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();
@@ -765,48 +785,37 @@ mod tests {
 
     #[test]
     fn conc_consumes_captured_bindings() {
+        let lit_int = |n: i64| {
+            mk_expr(ExpressionKind::Literal(Literal {
+                kind: LiteralKind::Int(n, None),
+                span: dummy_span(),
+            }))
+        };
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "conc".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("conc"),
                 generics: vec![],
                 params: vec![],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
-                body: Block {
-                    statements: vec![
-                        Statement::LetBinding {
-                            mutable: false,
-                            name: Identifier {
-                                name: "value".into(),
-                            },
-                            type_annotation: Some(Type {
-                                name: "Int32".into(),
-                                generic_args: vec![],
-                            }),
-                            initializer: Expression::Literal(Literal::Int(1, None)),
-                        },
-                        Statement::Conc {
-                            body: Block {
-                                statements: vec![Statement::Expression(Expression::Identifier(
-                                    Identifier {
-                                        name: "value".into(),
-                                    },
-                                ))],
-                                trailing_expression: None,
-                            },
-                        },
-                        Statement::Return(Some(Expression::Identifier(Identifier {
-                            name: "value".into(),
-                        }))),
-                    ],
-                    trailing_expression: None,
-                },
-            }],
+                return_type: Some(mk_type("Int32")),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        name: mk_ident("value"),
+                        type_annotation: Some(mk_type("Int32")),
+                        initializer: lit_int(1),
+                    }),
+                    mk_stmt(StatementKind::Conc {
+                        body: mk_block(vec![mk_stmt(StatementKind::Expression(mk_expr(
+                            ExpressionKind::Identifier(mk_ident("value")),
+                        )))]),
+                    }),
+                    mk_stmt(StatementKind::Return(Some(mk_expr(
+                        ExpressionKind::Identifier(mk_ident("value")),
+                    )))),
+                ]),
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();
@@ -816,41 +825,35 @@ mod tests {
 
     #[test]
     fn let_mut_not_tracked() {
+        let lit_int = |n: i64| {
+            mk_expr(ExpressionKind::Literal(Literal {
+                kind: LiteralKind::Int(n, None),
+                span: dummy_span(),
+            }))
+        };
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "mut_ok".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("mut_ok"),
                 generics: vec![],
                 params: vec![],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
-                body: Block {
-                    statements: vec![
-                        Statement::LetBinding {
-                            mutable: true,
-                            name: Identifier {
-                                name: "counter".into(),
-                            },
-                            type_annotation: Some(Type {
-                                name: "Int32".into(),
-                                generic_args: vec![],
-                            }),
-                            initializer: Expression::Literal(Literal::Int(1, None)),
-                        },
-                        Statement::Expression(Expression::Identifier(Identifier {
-                            name: "counter".into(),
-                        })),
-                        Statement::Return(Some(Expression::Identifier(Identifier {
-                            name: "counter".into(),
-                        }))),
-                    ],
-                    trailing_expression: None,
-                },
-            }],
+                return_type: Some(mk_type("Int32")),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: true,
+                        name: mk_ident("counter"),
+                        type_annotation: Some(mk_type("Int32")),
+                        initializer: lit_int(1),
+                    }),
+                    mk_stmt(StatementKind::Expression(mk_expr(
+                        ExpressionKind::Identifier(mk_ident("counter")),
+                    ))),
+                    mk_stmt(StatementKind::Return(Some(mk_expr(
+                        ExpressionKind::Identifier(mk_ident("counter")),
+                    )))),
+                ]),
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();
@@ -859,41 +862,36 @@ mod tests {
 
     #[test]
     fn ref_binding_not_consumed() {
+        // ref<Int32> parameter — needs a generic type arg
+        let ref_type = Spanned::new(
+            TypeKind {
+                name: "ref".into(),
+                generic_args: vec![mk_type("Int32")],
+            },
+            dummy_span(),
+        );
+        let param = Parameter {
+            name: mk_ident("data"),
+            type_annotation: ref_type,
+            span: dummy_span(),
+        };
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "shared".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("shared"),
                 generics: vec![],
-                params: vec![Parameter {
-                    name: Identifier {
-                        name: "data".into(),
-                    },
-                    type_annotation: Type {
-                        name: "ref".into(),
-                        generic_args: vec![Type {
-                            name: "Int32".into(),
-                            generic_args: vec![],
-                        }],
-                    },
-                }],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
-                body: Block {
-                    statements: vec![
-                        Statement::Expression(Expression::Identifier(Identifier {
-                            name: "data".into(),
-                        })),
-                        Statement::Return(Some(Expression::Identifier(Identifier {
-                            name: "data".into(),
-                        }))),
-                    ],
-                    trailing_expression: None,
-                },
-            }],
+                params: vec![param],
+                return_type: Some(mk_type("Int32")),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::Expression(mk_expr(
+                        ExpressionKind::Identifier(mk_ident("data")),
+                    ))),
+                    mk_stmt(StatementKind::Return(Some(mk_expr(
+                        ExpressionKind::Identifier(mk_ident("data")),
+                    )))),
+                ]),
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();
@@ -902,59 +900,51 @@ mod tests {
 
     #[test]
     fn merge_on_ref_is_shared() {
+        let lit_int = |n: i64| {
+            mk_expr(ExpressionKind::Literal(Literal {
+                kind: LiteralKind::Int(n, None),
+                span: dummy_span(),
+            }))
+        };
+        let ref_node_type = Spanned::new(
+            TypeKind {
+                name: "ref".into(),
+                generic_args: vec![mk_type("Node")],
+            },
+            dummy_span(),
+        );
         let module = Module {
             name: None,
-            declarations: vec![Declaration::Function {
-                name: Identifier {
-                    name: "merge_ref".into(),
-                },
+            declarations: vec![mk_decl(DeclarationKind::Function {
+                name: mk_ident("merge_ref"),
                 generics: vec![],
                 params: vec![],
-                return_type: Some(Type {
-                    name: "Int32".into(),
-                    generic_args: vec![],
-                }),
-                body: Block {
-                    statements: vec![
-                        Statement::LetBinding {
-                            mutable: false,
-                            name: Identifier {
-                                name: "node".into(),
-                            },
-                            type_annotation: Some(Type {
-                                name: "ref".into(),
-                                generic_args: vec![Type {
-                                    name: "Node".into(),
-                                    generic_args: vec![],
-                                }],
-                            }),
-                            initializer: Expression::Placeholder("node".into()),
-                        },
-                        Statement::LetBinding {
-                            mutable: false,
-                            name: Identifier {
-                                name: "updated".into(),
-                            },
-                            type_annotation: None,
-                            initializer: Expression::MergeExpression {
-                                base: Some(Box::new(Expression::Identifier(Identifier {
-                                    name: "node".into(),
-                                }))),
-                                fields: vec![(
-                                    Identifier {
-                                        name: "child".into(),
-                                    },
-                                    Expression::Identifier(Identifier {
-                                        name: "node".into(),
-                                    }),
-                                )],
-                            },
-                        },
-                        Statement::Return(Some(Expression::Literal(Literal::Int(0, None)))), 
-                    ],
-                    trailing_expression: None,
-                },
-            }],
+                return_type: Some(mk_type("Int32")),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        name: mk_ident("node"),
+                        type_annotation: Some(ref_node_type),
+                        initializer: mk_expr(ExpressionKind::Placeholder("node".into())),
+                    }),
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        name: mk_ident("updated"),
+                        type_annotation: None,
+                        initializer: mk_expr(ExpressionKind::MergeExpression {
+                            base: Some(Box::new(mk_expr(ExpressionKind::Identifier(mk_ident(
+                                "node",
+                            ))))),
+                            fields: vec![(
+                                mk_ident("child"),
+                                mk_expr(ExpressionKind::Identifier(mk_ident("node"))),
+                            )],
+                        }),
+                    }),
+                    mk_stmt(StatementKind::Return(Some(lit_int(0)))),
+                ]),
+            })],
+            span: dummy_span(),
         };
 
         let mut analyzer = LiveAnalyzer::new();

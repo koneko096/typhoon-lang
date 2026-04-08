@@ -1,7 +1,25 @@
 // src/ast.rs
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+impl<T> Spanned<T> {
+    pub fn new(node: T, span: Span) -> Self {
+        Spanned { node, span }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
+pub struct Literal {
+    pub kind: LiteralKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiteralKind {
     Int(i64, Option<String>),
     Float(f64, Option<String>),
     Bool(bool),
@@ -44,13 +62,18 @@ pub enum Operator {
     Borrow,
 }
 
+use crate::span::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identifier {
     pub name: String,
+    pub span: Span,
 }
 
+pub type Expression = Spanned<ExpressionKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expression {
+pub enum ExpressionKind {
     Literal(Literal),
     Identifier(Identifier),
     BinaryOp {
@@ -107,10 +130,13 @@ pub enum Expression {
 pub struct Block {
     pub statements: Vec<Statement>,
     pub trailing_expression: Option<Box<Expression>>,
+    pub span: Span,
 }
 
+pub type Statement = Spanned<StatementKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Statement {
+pub enum StatementKind {
     // Let binding
     LetBinding {
         mutable: bool,
@@ -148,14 +174,18 @@ pub enum Statement {
     Empty,
 }
 
+pub type ElseBranch = Spanned<ElseBranchKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum ElseBranch {
+pub enum ElseBranchKind {
     Block(Block),       // else { ... }
     If(Box<Statement>), // else if ... (where Statement is If)
 }
 
+pub type LoopKind = Spanned<LoopKindKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum LoopKind {
+pub enum LoopKindKind {
     Block(Block),
     For {
         pattern: Pattern,
@@ -168,14 +198,18 @@ pub enum LoopKind {
     },
 }
 
+pub type UsePath = Spanned<UsePathKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct UsePath {
+pub struct UsePathKind {
     pub segments: Vec<String>,
     pub wildcard: bool,
 }
 
+pub type Type = Spanned<TypeKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct Type {
+pub struct TypeKind {
     pub name: String,
     pub generic_args: Vec<Type>,
 }
@@ -184,28 +218,37 @@ pub struct Type {
 pub struct Parameter {
     pub name: Identifier,
     pub type_annotation: Type,
+    pub span: Span,
 }
 
+pub type GenericParam = Spanned<GenericParamKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct GenericParam {
+pub struct GenericParamKind {
     pub name: Identifier,
     pub bounds: Vec<GenericBound>,
 }
 
+pub type GenericBound = Spanned<GenericBoundKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct GenericBound {
+pub struct GenericBoundKind {
     pub type_name: Type,
 }
 
+pub type MatchArm = Spanned<MatchArmKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct MatchArm {
+pub struct MatchArmKind {
     pub pattern: Pattern,
     pub guard: Option<Expression>,
     pub body: Expression,
 }
 
+pub type Pattern = Spanned<PatternKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
+pub enum PatternKind {
     Wildcard,
     Identifier(Identifier),
     Literal(Literal),
@@ -228,8 +271,10 @@ pub enum Pattern {
     },
 }
 
+pub type Declaration = Spanned<DeclarationKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Declaration {
+pub enum DeclarationKind {
     Function {
         name: Identifier,
         generics: Vec<GenericParam>,
@@ -271,21 +316,27 @@ pub enum Declaration {
     UnsafeOrExtern(UnsafeOrExtern),
 }
 
+pub type EnumVariant = Spanned<EnumVariantKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct EnumVariant {
+pub struct EnumVariantKind {
     pub name: Identifier,
     pub payload: Option<EnumVariantPayload>,
 }
 
+pub type EnumVariantPayload = Spanned<EnumVariantPayloadKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum EnumVariantPayload {
+pub enum EnumVariantPayloadKind {
     Unit(Type),
     Tuple(Vec<Type>),
     Struct(Vec<(Identifier, Type)>),
 }
 
+pub type FunctionSignature = Spanned<FunctionSignatureKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct FunctionSignature {
+pub struct FunctionSignatureKind {
     pub name: Identifier,
     pub generics: Vec<GenericParam>,
     pub params: Vec<Parameter>,
@@ -296,10 +347,13 @@ pub struct FunctionSignature {
 pub struct Module {
     pub name: Option<String>,
     pub declarations: Vec<Declaration>,
+    pub span: Span,
 }
 
+pub type UnsafeOrExtern = Spanned<UnsafeOrExternKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum UnsafeOrExtern {
+pub enum UnsafeOrExternKind {
     Extern {
         abi: String,
         declarations: Vec<FFIDeclaration>,
@@ -307,8 +361,10 @@ pub enum UnsafeOrExtern {
     UnsafeBlock(Block),
 }
 
+pub type FFIDeclaration = Spanned<FFIDeclarationKind>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct FFIDeclaration {
+pub struct FFIDeclarationKind {
     pub fn_name: Identifier,
     pub params: Vec<Type>,
     pub return_type: Type,

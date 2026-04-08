@@ -1,5 +1,3 @@
-// src/lexer.rs
-
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -85,17 +83,19 @@ pub enum TokenType {
     Error,
 }
 
+use crate::span::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub token_type: TokenType,
     pub lexeme: String,
-    pub line: usize,
-    pub col: usize,
+    pub span: Span,
 }
 
 pub struct Lexer {
     input: Vec<char>,
-    pos: usize,
+    current_offset: usize,
+    start_offset: usize,
     line: usize,
     col: usize,
     keywords: HashMap<String, TokenType>,
@@ -113,7 +113,8 @@ impl Lexer {
             ("interface", TokenType::Interface),
             ("impl", TokenType::Impl),
             ("extend", TokenType::Extend),
-            ("newtype", TokenType::Newtype), ("namespace", TokenType::Namespace),
+            ("newtype", TokenType::Newtype),
+            ("namespace", TokenType::Namespace),
             ("match", TokenType::Match),
             ("if", TokenType::If),
             ("else", TokenType::Else),
@@ -137,7 +138,8 @@ impl Lexer {
 
         Lexer {
             input: input.chars().collect(),
-            pos: 0,
+            current_offset: 0,
+            start_offset: 0,
             line: 1,
             col: 1,
             keywords,
@@ -153,17 +155,33 @@ impl Lexer {
             }
             tokens.push(self.next_token());
         }
+        // Create EOF token with the span of the last character or a default span if empty
+        let eof_span = if tokens.is_empty() {
+            Span::new(
+                self.current_offset,
+                self.current_offset,
+                self.line,
+                self.col,
+            )
+        } else {
+            let last_token = tokens.last().unwrap();
+            Span::new(
+                last_token.span.end,
+                last_token.span.end,
+                self.line,
+                self.col,
+            )
+        };
         tokens.push(Token {
             token_type: TokenType::Eof,
             lexeme: "".to_string(),
-            line: self.line,
-            col: self.col,
+            span: eof_span,
         });
         tokens
     }
 
     fn next_token(&mut self) -> Token {
-        let start_col = self.col;
+        self.start_offset = self.current_offset;
         let c = self.advance();
 
         let ty = match c {
@@ -277,23 +295,21 @@ impl Lexer {
                 }
             }
             '@' => TokenType::At,
-            '"' => return self.string_lit(start_col),
-            _ if c.is_ascii_digit() => return self.number_lit(c, start_col),
-            _ if c.is_alphabetic() || c == '_' => return self.identifier(c, start_col),
+            '"' => return self.string_lit(),
+            _ if c.is_ascii_digit() => return self.number_lit(c),
+            _ if c.is_alphabetic() || c == '_' => return self.identifier(c),
             _ => TokenType::Error,
         };
-
         Token {
             token_type: ty,
-            lexeme: self.input[self.pos - (self.col - start_col)..self.pos]
+            lexeme: self.input[self.start_offset..self.current_offset]
                 .iter()
                 .collect(),
-            line: self.line,
-            col: start_col,
+            span: Span::new(self.start_offset, self.current_offset, self.line, self.col),
         }
     }
 
-    fn string_lit(&mut self, start_col: usize) -> Token {
+    fn string_lit(&mut self) -> Token {
         let mut val = String::new();
         while !self.is_at_end() && self.peek() != '"' {
             if self.peek() == '\n' {
@@ -306,20 +322,18 @@ impl Lexer {
             return Token {
                 token_type: TokenType::Error,
                 lexeme: val,
-                line: self.line,
-                col: start_col,
+                span: Span::new(self.start_offset, self.current_offset, self.line, self.col),
             };
         }
         self.advance(); // consume closing "
         Token {
             token_type: TokenType::StrLit,
             lexeme: val,
-            line: self.line,
-            col: start_col,
+            span: Span::new(self.start_offset, self.current_offset, self.line, self.col),
         }
     }
 
-    fn number_lit(&mut self, first: char, start_col: usize) -> Token {
+    fn number_lit(&mut self, first: char) -> Token {
         let mut lexeme = first.to_string();
         let mut is_float = false;
         while !self.is_at_end() && (self.peek().is_ascii_digit() || self.peek() == '_') {
@@ -346,12 +360,11 @@ impl Lexer {
                 TokenType::IntLit
             },
             lexeme,
-            line: self.line,
-            col: start_col,
+            span: Span::new(self.start_offset, self.current_offset, self.line, self.col),
         }
     }
 
-    fn identifier(&mut self, first: char, start_col: usize) -> Token {
+    fn identifier(&mut self, first: char) -> Token {
         let mut lexeme = first.to_string();
         while !self.is_at_end() && (self.peek().is_ascii_alphanumeric() || self.peek() == '_') {
             lexeme.push(self.advance());
@@ -360,8 +373,7 @@ impl Lexer {
         Token {
             token_type: ty,
             lexeme,
-            line: self.line,
-            col: start_col,
+            span: Span::new(self.start_offset, self.current_offset, self.line, self.col),
         }
     }
 
@@ -399,25 +411,25 @@ impl Lexer {
     }
 
     fn is_at_end(&self) -> bool {
-        self.pos >= self.input.len()
+        self.current_offset >= self.input.len()
     }
     fn peek(&self) -> char {
         if self.is_at_end() {
             '\0'
         } else {
-            self.input[self.pos]
+            self.input[self.current_offset]
         }
     }
     fn peek_next(&self) -> char {
-        if self.pos + 1 >= self.input.len() {
+        if self.current_offset + 1 >= self.input.len() {
             '\0'
         } else {
-            self.input[self.pos + 1]
+            self.input[self.current_offset + 1]
         }
     }
     fn advance(&mut self) -> char {
-        let c = self.input[self.pos];
-        self.pos += 1;
+        let c = self.input[self.current_offset];
+        self.current_offset += 1;
         if c == '\n' {
             self.line += 1;
             self.col = 1;
@@ -427,7 +439,7 @@ impl Lexer {
         c
     }
     fn match_char(&mut self, expected: char) -> bool {
-        if self.is_at_end() || self.input[self.pos] != expected {
+        if self.is_at_end() || self.input[self.current_offset] != expected {
             return false;
         }
         self.advance();
