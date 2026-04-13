@@ -18,7 +18,8 @@ fn collect_ty_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
+        let entries =
+            fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("read_dir entry {}: {}", dir.display(), e))?;
             let path = entry.path();
@@ -47,7 +48,9 @@ fn mangle(ns: &str, name: &str) -> String {
     format!("{}__{}", ns, name)
 }
 
-fn extract_namespace_units(modules: Vec<Module>) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
+fn extract_namespace_units(
+    modules: Vec<Module>,
+) -> Result<HashMap<String, NamespaceUnit>, Vec<String>> {
     let mut errors = Vec::new();
     let mut units: HashMap<String, NamespaceUnit> = HashMap::new();
 
@@ -103,7 +106,10 @@ fn build_namespace_decl_maps(
         for decl in &unit.declarations {
             if let Some(id) = decl_name(decl) {
                 if map.contains_key(&id.name) {
-                    errors.push(format!("Duplicate declaration '{}' in namespace '{}'", id.name, ns));
+                    errors.push(format!(
+                        "Duplicate declaration '{}' in namespace '{}'",
+                        id.name, ns
+                    ));
                 } else {
                     map.insert(id.name.clone(), mangle(ns, &id.name));
                 }
@@ -134,7 +140,10 @@ fn use_target(path: &UsePath) -> Option<(String, Option<String>, bool)> {
     Some((head.join("::"), Some(tail[0].to_string()), false))
 }
 
-fn topo_sort(names: &HashSet<String>, edges: &HashMap<String, HashSet<String>>) -> Result<Vec<String>, Vec<String>> {
+fn topo_sort(
+    names: &HashSet<String>,
+    edges: &HashMap<String, HashSet<String>>,
+) -> Result<Vec<String>, Vec<String>> {
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum Mark {
         Temp,
@@ -158,7 +167,10 @@ fn topo_sort(names: &HashSet<String>, edges: &HashMap<String, HashSet<String>>) 
             }
             if m == Mark::Temp {
                 stack.push(n.to_string());
-                errors.push(format!("Cyclic namespace dependency: {}", stack.join(" -> ")));
+                errors.push(format!(
+                    "Cyclic namespace dependency: {}",
+                    stack.join(" -> ")
+                ));
                 stack.pop();
                 return;
             }
@@ -186,7 +198,10 @@ fn topo_sort(names: &HashSet<String>, edges: &HashMap<String, HashSet<String>>) 
     }
 }
 
-fn compute_transitive(namespaces: &HashMap<String, NamespaceUnit>, entry_ns: &str) -> Result<Vec<String>, Vec<String>> {
+fn compute_transitive(
+    namespaces: &HashMap<String, NamespaceUnit>,
+    entry_ns: &str,
+) -> Result<Vec<String>, Vec<String>> {
     let mut errors = Vec::new();
     let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
     for (ns, unit) in namespaces {
@@ -195,7 +210,10 @@ fn compute_transitive(namespaces: &HashMap<String, NamespaceUnit>, entry_ns: &st
             if let Some((target_ns, _name, _wild)) = use_target(u) {
                 deps.insert(target_ns);
             } else {
-                errors.push(format!("Invalid use path in namespace '{}': {:?}", ns, u.node.segments));
+                errors.push(format!(
+                    "Invalid use path in namespace '{}': {:?}",
+                    ns, u.node.segments
+                ));
             }
         }
         edges.insert(ns.clone(), deps);
@@ -256,7 +274,10 @@ fn build_alias_map(
         let target_map = match decl_maps.get(&target_ns) {
             Some(m) => m,
             None => {
-                errors.push(format!("Unknown namespace '{}' in use from '{}'", target_ns, ns));
+                errors.push(format!(
+                    "Unknown namespace '{}' in use from '{}'",
+                    target_ns, ns
+                ));
                 continue;
             }
         };
@@ -336,11 +357,16 @@ fn expand_impl_and_extension_decls(decl: Declaration) -> Vec<Declaration> {
 }
 
 pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
-    let root = entry_file
-        .parent()
-        .ok_or_else(|| vec![format!("Entry file has no parent: {}", entry_file.display())])?;
+    let root = entry_file.parent().ok_or_else(|| {
+        vec![format!(
+            "Entry file has no parent: {}",
+            entry_file.display()
+        )]
+    })?;
 
     let files = collect_ty_files(root).map_err(|e| vec![e])?;
+
+    println!("<<<< {:?}", files);
     let mut modules = Vec::new();
     let mut errors = Vec::new();
     for file in files {
@@ -354,11 +380,14 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
     }
 
     let units = extract_namespace_units(modules)?;
-    let entry_module = parse_file(entry_file).map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
-    let entry_ns = entry_module
-        .name
-        .clone()
-        .ok_or_else(|| vec![format!("Entry file missing `namespace`: {}", entry_file.display())])?;
+    let entry_module =
+        parse_file(entry_file).map_err(|e| vec![format!("{}: {}", entry_file.display(), e)])?;
+    let entry_ns = entry_module.name.clone().ok_or_else(|| {
+        vec![format!(
+            "Entry file missing `namespace`: {}",
+            entry_file.display()
+        )]
+    })?;
 
     let decl_maps = build_namespace_decl_maps(&units)?;
     let order = compute_transitive(&units, &entry_ns)?;
@@ -372,7 +401,9 @@ pub fn compile_project(entry_file: &Path) -> Result<Module, Vec<String>> {
         let unit = units.get(&ns).unwrap();
         for mut decl in unit.declarations.clone() {
             desugar.rename_declaration(&mut decl, &alias);
-            desugar.desugar_declaration(&mut decl).map_err(|e| vec![format!("{}: {}", ns, e)])?;
+            desugar
+                .desugar_declaration(&mut decl)
+                .map_err(|e| vec![format!("{}: {}", ns, e)])?;
             for expanded in expand_impl_and_extension_decls(decl) {
                 all_decls.push(expanded);
             }

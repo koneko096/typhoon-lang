@@ -107,8 +107,7 @@ impl Resolver {
             } => {
                 let type_params = self.generic_type_params(generics);
                 for param in params {
-                    if let Err(err) =
-                        self.resolve_type(scope, &param.type_annotation, &type_params)
+                    if let Err(err) = self.resolve_type(scope, &param.type_annotation, &type_params)
                     {
                         return Err(err);
                     }
@@ -189,7 +188,9 @@ impl Resolver {
             return Ok(());
         }
 
-        let common_named = ["Option", "Result", "Buf", "Map", "Set", "Node", "Ref", "Array"];
+        let common_named = [
+            "Option", "Result", "Buf", "Map", "Set", "Node", "Ref", "Array", "Chan", "chan", "ref",
+        ];
         if common_named.contains(&name.as_str()) {
             return Ok(());
         }
@@ -360,10 +361,16 @@ impl Resolver {
     fn resolve_expression(&mut self, scope: ScopeId, expr: &Expression) -> Result<(), String> {
         match &expr.node {
             ExpressionKind::Identifier(id) => {
-                if self.lookup(scope, &id.name).is_none() {
-                    Err(format!("Unresolved identifier '{}'", id.name))
-                } else {
-                    Ok(())
+                // Allow built-in identifiers
+                match id.name.as_str() {
+                    "Ok" | "Err" | "Some" | "None" | "chan" | "break" | "continue" => Ok(()),
+                    _ => {
+                        if self.lookup(scope, &id.name).is_none() {
+                            Err(format!("Unresolved identifier '{}'", id.name))
+                        } else {
+                            Ok(())
+                        }
+                    }
                 }
             }
             ExpressionKind::Block(block) => {
@@ -462,19 +469,8 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn normalize_source(source: &str) -> String {
-        let mut body = source.trim().to_string();
-        if !body.starts_with("namespace main") {
-            body = format!("namespace main\n{}", body);
-        }
-        if !body.contains("fn main") {
-            body.push_str("\nfn main() -> Int32 { return 0; }");
-        }
-        body
-    }
-
     fn resolve(source: &str) -> Resolver {
-        let module = Parser::new(Lexer::new(normalize_source(source)).tokenize())
+        let module = Parser::new(Lexer::new(source.trim().to_string()).tokenize())
             .parse_module()
             .unwrap();
         let mut resolver = Resolver::new();
@@ -487,9 +483,8 @@ mod tests {
         let resolver = resolve(
             "fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }",
         );
-        // normalize_source appends `fn main`, adding it as a 4th decl alongside
         // compute, count, and accumulator.
-        assert_eq!(resolver.decls.len(), 4);
+        assert_eq!(resolver.decls.len(), 3);
     }
 
     #[test]
@@ -509,7 +504,11 @@ mod tests {
     fn rejects_duplicate_declarations() {
         // Use normalize_source so parse_module gets the required `fn main`.
         // The duplicate Foo structs should still cause a resolver error.
-        let tokens = Lexer::new(normalize_source("struct Foo {} struct Foo {}")).tokenize();
+        let tokens = Lexer::new(
+            "namespace main\nstruct Foo {} struct Foo {}\nfn main() -> Int32 { return 0; }"
+                .to_string(),
+        )
+        .tokenize();
         let module = Parser::new(tokens).parse_module().unwrap();
         let mut resolver = Resolver::new();
         let err = resolver.resolve_module(&module).unwrap_err();

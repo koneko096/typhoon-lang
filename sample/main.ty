@@ -6,10 +6,23 @@ struct Popcount {
 
 impl Popcount {
   fn check(self, even: Int32) -> Int32 {
-    let mut count = 0;
+    let ch: ref chan<Int32> = chan<Int32>();
     for x in self.ar {
-      if (x & even) == x {
-        count = count + 1;
+      conc {
+        let n = match (x & even) {
+          x => 1
+          _ => 0
+        }
+        ch.send(n);
+      }
+    }
+
+    let mut count = 0;
+    let mut complete = false;
+    while !complete {
+      match ch.try_recv() {
+        Some(value) => { count = count + value; }
+        None => { complete = true; }
       }
     }
     return count;

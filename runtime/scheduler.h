@@ -74,6 +74,10 @@ void ty_chan_send(struct SlabArena* arena, TyChan* chan, void* elem);
  * Blocks (cooperative) if the channel is empty. */
 void ty_chan_recv(struct SlabArena* arena, TyChan* chan, void* out);
 
+/* Try receive into `out`. Returns 1 if received, 0 if no value available.
+ * Never blocks. */
+int ty_chan_try_recv(struct SlabArena* arena, TyChan* chan, void* out);
+
 /* Close a channel; receivers drain remaining items then get zeroed values. */
 void ty_chan_close(TyChan* chan);
 

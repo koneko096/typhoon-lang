@@ -68,7 +68,11 @@ impl Parser {
         let mut declarations = Vec::new();
         let mut name = None;
         if self.match_token(TokenType::Namespace) {
-            name = Some(self.namespace_path()?);
+            let ns = self.namespace_path()?;
+            if ns != "main" {
+                return Err("Only 'namespace main' is allowed".to_string());
+            }
+            name = Some(ns);
         }
         while !self.is_at_end() && self.peek_token().token_type != TokenType::Eof {
             declarations.push(self.declaration()?);
@@ -508,6 +512,13 @@ impl Parser {
                 expr: Box::new(expr),
             }));
         }
+        if self.match_token(TokenType::LogicalNot) {
+            let expr = self.unary()?;
+            return Ok(self.make_expr(ExpressionKind::UnaryOp {
+                op: Operator::Not,
+                expr: Box::new(expr),
+            }));
+        }
         let mut expr = self.primary()?;
         while self.match_token(TokenType::Try) {
             expr = self.make_expr(ExpressionKind::TryOperator {
@@ -624,7 +635,28 @@ impl Parser {
                 {
                     return self.struct_init(identifier);
                 }
-                if self.peek_token().token_type == TokenType::LParen {
+                // Handle chan<T>() construction
+                if identifier.name == "chan" && self.peek_token().token_type == TokenType::LessThan
+                {
+                    self.advance_token(); // consume <
+                    let _elem_type = self.parse_type()?;
+                    self.consume(TokenType::GreaterThan, "Expected '>' after channel type")?;
+                    if self.match_token(TokenType::LParen) {
+                        self.consume(TokenType::RParen, "Expected ')' after chan<T>")?;
+                        let span = identifier.span.join(self.last_token_span());
+                        let expr = Spanned::new(
+                            ExpressionKind::Call {
+                                func: Box::new(ident_expr.clone()),
+                                args: Vec::new(),
+                            },
+                            span,
+                            self.alloc_id(),
+                        );
+                        self.primary_postfix(expr)
+                    } else {
+                        Err("Expected '(' after chan<T>".to_string())
+                    }
+                } else if self.peek_token().token_type == TokenType::LParen {
                     self.advance_token();
                     let mut args = Vec::new();
                     while self.peek_token().token_type != TokenType::RParen {
@@ -679,7 +711,18 @@ impl Parser {
                 );
                 self.primary_postfix(expr)
             }
-            TokenType::LBrace => self.merge_expression(),
+            TokenType::LBrace => {
+                // Lookahead: if next token after { is ..., it's a merge expression
+                // Otherwise it's a block
+                if self.peek_ahead(1).token_type == TokenType::Spread {
+                    self.merge_expression()
+                } else {
+                    let block = self.block()?;
+                    let span = block.span;
+                    let expr = Spanned::new(ExpressionKind::Block(block), span, self.alloc_id());
+                    self.primary_postfix(expr)
+                }
+            }
             token => Err(format!("Expected expression, got {:?}", token)),
         }
     }
@@ -923,6 +966,23 @@ impl Parser {
             }));
         }
 
+        // Handle `chan<T>` channel type syntax
+        if self.peek_token().token_type == TokenType::Identifier
+            && self.peek_token().lexeme == "chan"
+        {
+            self.advance_token();
+            if self.match_token(TokenType::LessThan) {
+                let inner = self.parse_type()?;
+                self.consume(TokenType::GreaterThan, "Expected '>' after channel type")?;
+                return Ok(self.make_type(TypeKind {
+                    name: "Chan".to_string(),
+                    generic_args: vec![inner],
+                }));
+            } else {
+                return Err("Expected '<T>' after 'chan' keyword in type".to_string());
+            }
+        }
+
         // Handle `&T` reference syntax (BitwiseAnd token used as reference type prefix)
         if self.peek_token().token_type == TokenType::BitwiseAnd {
             self.advance_token();
@@ -1102,31 +1162,36 @@ impl Parser {
                 })))
             }
             TokenType::Match => {
-                let start_span = self.peek_token().span;
                 let expr = self.match_expression()?;
-                let ExpressionKind::Match {
-                    expr: scrutinee,
-                    arms,
-                } = expr.node
-                else {
-                    return Err("internal: match_expression did not return Match".to_string());
-                };
-                self.match_token(TokenType::Semicolon);
-                Ok(Some(self.make_spanned_with_span(
-                    StatementKind::Match {
-                        expr: *scrutinee,
+                if self.match_token(TokenType::Semicolon) {
+                    // Match followed by semicolon becomes an expression statement
+                    Ok(Some(self.make_stmt(StatementKind::Expression(expr))))
+                } else {
+                    // Match without semicolon can only be a trailing expression
+                    // So return None to signal to block() to use it as trailing expr
+                    // BUT first, we need to "undo" the consume of tokens...
+                    // Actually, this doesn't work because we already consumed the tokens.
+                    // Instead, convert to StatementKind::Match for backward compat
+                    let ExpressionKind::Match {
+                        expr: scrutinee,
                         arms,
-                    },
-                    start_span.join(self.last_token_span()),
-                )))
+                    } = expr.node
+                    else {
+                        return Err("internal: match_expression did not return Match".to_string());
+                    };
+                    Ok(Some(self.make_spanned_with_span(
+                        StatementKind::Match {
+                            expr: *scrutinee,
+                            arms,
+                        },
+                        expr.span,
+                    )))
+                }
             }
             _ => {
                 let expr = self.expression()?;
-                if self.match_token(TokenType::Semicolon) {
-                    Ok(Some(self.make_stmt(StatementKind::Expression(expr))))
-                } else {
-                    Err("Expression statements must end in ';'. Trailing expressions are only allowed at block end.".to_string())
-                }
+                self.match_token(TokenType::Semicolon);
+                Ok(Some(self.make_stmt(StatementKind::Expression(expr))))
             }
         }
     }
@@ -1322,6 +1387,19 @@ impl Parser {
         })
     }
 
+    fn peek_ahead(&self, offset: usize) -> Token {
+        self.tokens
+            .get(self.pos + offset)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.tokens.last().cloned().unwrap_or_else(|| Token {
+                    token_type: TokenType::Eof,
+                    lexeme: "".to_string(),
+                    span: Span::default(),
+                })
+            })
+    }
+
     fn last_token_span(&self) -> Span {
         self.tokens
             .get(self.pos.saturating_sub(1))
@@ -1360,19 +1438,8 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
 
-    fn normalize_source(source: &str) -> String {
-        let mut body = source.trim().to_string();
-        if !body.starts_with("namespace main") {
-            body = format!("namespace main\n{}", body);
-        }
-        if !body.contains("fn main") {
-            body.push_str("\nfn main() -> Int32 { return 0; }");
-        }
-        body
-    }
-
     fn parse_source(source: &str) -> Module {
-        let tokens = Lexer::new(normalize_source(source)).tokenize();
+        let tokens = Lexer::new(source.trim().to_string()).tokenize();
         Parser::new(tokens).parse_module().unwrap()
     }
 
@@ -1384,7 +1451,7 @@ mod tests {
     #[test]
     fn test_parse_struct() {
         let module = parse_source("struct User { name: Str, age: Int32 }");
-        assert_eq!(module.declarations.len(), 2);
+        assert_eq!(module.declarations.len(), 1);
         if let DeclarationKind::Struct { name, fields, .. } = &module.declarations[0].node {
             assert_eq!(name.name, "User");
             assert_eq!(fields.len(), 2);
@@ -1527,9 +1594,10 @@ mod tests {
     #[test]
     fn namespace_rejected_if_not_main() {
         let source = "namespace foo\nfn main() -> Int32 { return 0; }";
-        let tokens = Lexer::new(normalize_source(source)).tokenize();
+        let tokens = Lexer::new(source.trim().to_string()).tokenize();
         let mut parser = Parser::new(tokens);
-        assert!(parser.parse_module().is_err());
+        let r = parser.parse_module();
+        assert!(r.is_err());
     }
 
     #[test]

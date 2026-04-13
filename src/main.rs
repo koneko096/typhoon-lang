@@ -66,6 +66,7 @@ fn main() {
         eprintln!("Failed to write IR file {}: {}", ll_path.display(), err);
         std::process::exit(1);
     }
+
     let build_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("build")
         .join("output");
@@ -85,7 +86,7 @@ fn main() {
     // Clang will find runtime.lib on Windows or libruntime.a on Unix
     cmd.arg("-lruntime");
 
-    // 5. Add static and output flags
+    // 5. Add output flags
     cmd.arg("-o").arg(&output);
 
     match cmd.status() {

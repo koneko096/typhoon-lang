@@ -48,6 +48,11 @@ This document outlines the step-by-step implementation of the Typhoon language a
     - [x] Array indexing typing `a[i] -> Option<T>` for both fixed arrays and `Array<T>`
     - [x] Method-call typing `x.method(args...)` via mangled function symbols (`__ty_method__Type__method`)
     - [x] Built-in `Array<T>.push(val) -> Unit` typing (in-place)
+    - [ ] Channel typing: `chan<T>()` constructor and methods
+      - [x] `send`
+      - [ ] `recv`
+      - [ ] `try_send`
+      - [x] `try_recv`
     - [x] Tests: inferred let types, function calls, polymorphic `Option`/`Result`
 - [ ] Desugaring
     - [x] Desugar `?` operator (verify compatible return type)
@@ -128,6 +133,8 @@ A few catches / limitations right now:
     - [x] Function prolog/epilog generation (stack frame layout)
     - [ ] Generic monomorphization
     - [x] Call lowering with ABI usage and argument passing/promotion
+    - [x] Channel construction: `chan<T>()` emits `@ty_chan_new` calls
+    - [x] Channel send/recv: emit `@ty_chan_send` and `@ty_chan_recv` calls
     - [ ] Pointer provenance metadata for `ref` vs linear pointers
     - [ ] Inline `@derive` generated helpers (Eq, Hash, Display)
 - [ ] Optimizations and Annotations
@@ -155,15 +162,19 @@ A few catches / limitations right now:
     - [x] Virtual memory reservation (`mmap`/`VirtualAlloc`)
     - [x] Integration with LLVM IR (heap type lowering uses allocator interfaces)
     - [x] (v1) Runtime heap API + array helpers are `arena`-backed (`ty_alloc`/`ty_realloc`/`ty_free`, `ty_array_from_fixed`, `ty_array_push`, `ty_array_get_ptr`)
-- [ ] Implement M:N Scheduler
-    - [ ] Work-stealing deques (one OS thread per core)
-    - [ ] Stackful coroutines (64 KB initial, grows on fault)
-    - [ ] Cooperative yielding at I/O and channel blocks
-    - [ ] Preemptive yielding via `SIGPROF`
-    - [ ] Task-local slabs recycled per coroutine to avoid cross-thread locking
-    - [ ] Scheduler API exposed to language runtime (`spawn`, `await`, `conc`)
+- [x] Implement M:N Scheduler
+    - [x] Work-stealing deques (one OS thread per core)
+    - [x] Stackful coroutines (64 KB initial, grows on fault)
+    - [x] Cooperative yielding at I/O and channel blocks
+    - [x] Preemptive yielding via `SIGPROF`
+    - [x] Task-local slabs recycled per coroutine to avoid cross-thread locking
+    - [x] Scheduler API exposed to language runtime (`spawn`, `await`, `conc`)
 - [ ] Implement Channels
-    - [ ] `chan<T>` as bounded ring buffer with coroutine waitlists
+    - [x] `chan<T>` type parsing and type system support
+    - [x] `chan<T>()` constructor in codegen (emits `@ty_chan_new`)
+    - [x] Channel method typing (`send`, `try_recv` with Option return)
+    - [x] `chan<T>` as bounded ring buffer with coroutine waitlists
+    - [x] Emit `@ty_chan_send` and `@ty_chan_recv` calls in codegen
     - [ ] Support `select`/`recv` semantics with fairness hints
     - [ ] Linear ownership of channel tokens (send consumes, recv produces)
 - [ ] **Milestone:** `conc` and `chan` examples run correctly under concurrent load. Benchmarked favorably against `jemalloc`.

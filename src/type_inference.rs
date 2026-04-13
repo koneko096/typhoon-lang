@@ -22,20 +22,30 @@ struct Scheme {
 
 impl Scheme {
     fn mono(ty: InferType) -> Self {
-        Self { vars: Vec::new(), ty }
+        Self {
+            vars: Vec::new(),
+            ty,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeError {
-    UnknownIdentifier { name: String, span: Option<Span> },
+    UnknownIdentifier {
+        name: String,
+        span: Option<Span>,
+    },
     TypeMismatch {
         expected: InferType,
         actual: InferType,
         context: String,
         span: Option<Span>,
     },
-    OccursCheck { var: TypeVarId, ty: InferType, span: Option<Span> },
+    OccursCheck {
+        var: TypeVarId,
+        ty: InferType,
+        span: Option<Span>,
+    },
 }
 
 pub struct TypeChecker {
@@ -72,6 +82,9 @@ impl TypeChecker {
                 self.check_function(name, decl)?;
             }
         }
+        // Freeze inferred expression types by applying final substitutions.
+        // Codegen reads this map directly and expects concrete types.
+        self.finalize_types();
         Ok(())
     }
 
@@ -92,10 +105,22 @@ impl TypeChecker {
         &self.types
     }
 
+    fn finalize_types(&mut self) {
+        let keys: Vec<NodeId> = self.types.keys().cloned().collect();
+        for k in keys {
+            if let Some(ty) = self.types.get(&k).cloned() {
+                self.types.insert(k, self.apply(&ty));
+            }
+        }
+    }
+
     fn seed_builtins(&mut self) {
         self.set_global(
             "__ty_buf_new".into(),
-            Scheme::mono(InferType::Fn(Vec::new(), Box::new(InferType::Con("Buf".into())))),
+            Scheme::mono(InferType::Fn(
+                Vec::new(),
+                Box::new(InferType::Con("Buf".into())),
+            )),
         );
         self.set_global(
             "__ty_buf_push_str".into(),
@@ -403,7 +428,6 @@ impl TypeChecker {
             }
             StatementKind::Match { expr, arms } => {
                 let scrutinee = self.infer_expression(expr)?;
-                let arm_ty = self.fresh_var();
                 for arm in arms {
                     self.push_scope();
                     self.bind_pattern(&arm.node.pattern, &scrutinee)?;
@@ -412,19 +436,20 @@ impl TypeChecker {
                         self.unify(guard_ty, InferType::Con("Bool".into()), Some(guard.span))?;
                     }
                     let body_ty = self.infer_expression(&arm.node.body)?;
-                    self.unify(body_ty, arm_ty.clone(), Some(arm.span))?;
+                    self.unify(body_ty, InferType::Con("Unit".into()), Some(arm.span))?;
                     self.pop_scope();
-                }
-                if let Some(expected) = expected_return {
-                    self.unify(arm_ty, expected.clone(), Some(stmt.span))?;
                 }
                 Ok(())
             }
             StatementKind::Loop { kind, body } => {
                 match &kind.node {
-                    LoopKindKind::For { pattern, iterator, .. } => {
+                    LoopKindKind::For {
+                        pattern, iterator, ..
+                    } => {
                         let iter_ty = self.infer_expression(iterator)?;
-                        let elem_ty = self.array_elem_type(&iter_ty).unwrap_or_else(|| self.fresh_var());
+                        let elem_ty = self
+                            .array_elem_type(&iter_ty)
+                            .unwrap_or_else(|| self.fresh_var());
                         self.push_scope();
                         self.bind_pattern(pattern, &elem_ty)?;
                         let _ = self.check_block(body, expected_return)?;
@@ -449,11 +474,25 @@ impl TypeChecker {
         let ty = match &expr.node {
             ExpressionKind::Literal(lit) => self.literal_type(lit, expr.span)?,
             ExpressionKind::Identifier(id) => {
-                let scheme = self.lookup(&id.name).cloned().ok_or_else(|| TypeError::UnknownIdentifier {
-                    name: id.name.clone(),
-                    span: Some(id.span),
-                })?;
-                self.instantiate(&scheme)
+                match id.name.as_str() {
+                    "chan" => {
+                        // chan has a generic return type that depends on context
+                        InferType::Con("Chan".into())
+                    }
+                    "break" | "continue" => {
+                        // break and continue are control flow; treat as Unit
+                        InferType::Con("Unit".into())
+                    }
+                    _ => {
+                        let scheme = self.lookup(&id.name).cloned().ok_or_else(|| {
+                            TypeError::UnknownIdentifier {
+                                name: id.name.clone(),
+                                span: Some(id.span),
+                            }
+                        })?;
+                        self.instantiate(&scheme)
+                    }
+                }
             }
             ExpressionKind::UnaryOp { op, expr: inner } => {
                 let ty = self.infer_expression(inner)?;
@@ -469,8 +508,21 @@ impl TypeChecker {
                     _ => ty,
                 }
             }
-            ExpressionKind::BinaryOp { op, left, right } => self.infer_binary(op, left, right, expr.span)?,
+            ExpressionKind::BinaryOp { op, left, right } => {
+                self.infer_binary(op, left, right, expr.span)?
+            }
             ExpressionKind::Call { func, args } => {
+                // Special handling for chan<T>() - func is Identifier("chan")
+                if let ExpressionKind::Identifier(id) = &func.node {
+                    if id.name == "chan" {
+                        let elem_ty = self.fresh_var();
+                        // chan() always produces a shared channel — wrap in Ref
+                        return Ok(InferType::App(
+                            "Ref".into(),
+                            vec![InferType::App("Chan".into(), vec![elem_ty])],
+                        ));
+                    }
+                }
                 if let ExpressionKind::FieldAccess { base, field } = &func.node {
                     let base_ty = self.infer_expression(base)?;
                     let mut arg_tys = Vec::new();
@@ -478,22 +530,60 @@ impl TypeChecker {
                         arg_tys.push(self.infer_expression(arg)?);
                     }
 
-                    if let InferType::App(name, mut ty_args) = self.apply(&base_ty) {
+                    let inner_ty = match self.apply(&base_ty) {
+                        InferType::App(ref name, ref args) if name == "Ref" && args.len() == 1 => {
+                            self.apply(&args[0])
+                        }
+                        other => other,
+                    };
+
+                    if let InferType::App(name, mut ty_args) = inner_ty {
                         if name == "Array" && ty_args.len() == 1 && field.name == "push" {
                             let elem = ty_args.remove(0);
                             if let Some(first) = arg_tys.first().cloned() {
                                 self.unify(first, elem, Some(expr.span))?;
                             }
                             InferType::Con("Unit".into())
+                        } else if name == "Chan" && ty_args.len() == 1 {
+                            let elem = ty_args.remove(0);
+                            match field.name.as_str() {
+                                "send" => {
+                                    if let Some(first) = arg_tys.first().cloned() {
+                                        self.unify(first, elem, Some(expr.span))?;
+                                    }
+                                    InferType::Con("Unit".into())
+                                }
+                                "try_recv" => InferType::App("Option".into(), vec![elem]),
+                                _ => {
+                                    let method_name =
+                                        format!("__ty_method__{}__{}", name, field.name);
+                                    let scheme =
+                                        self.lookup(&method_name).cloned().ok_or_else(|| {
+                                            TypeError::UnknownIdentifier {
+                                                name: method_name.clone(),
+                                                span: Some(field.span),
+                                            }
+                                        })?;
+                                    let callee = self.instantiate(&scheme);
+                                    let mut full_args = vec![base_ty];
+                                    full_args.extend(arg_tys);
+                                    let ret = self.fresh_var();
+                                    self.unify(
+                                        callee,
+                                        InferType::Fn(full_args, Box::new(ret.clone())),
+                                        Some(expr.span),
+                                    )?;
+                                    ret
+                                }
+                            }
                         } else {
                             let method_name = format!("__ty_method__{}__{}", name, field.name);
-                            let scheme = self
-                                .lookup(&method_name)
-                                .cloned()
-                                .ok_or_else(|| TypeError::UnknownIdentifier {
+                            let scheme = self.lookup(&method_name).cloned().ok_or_else(|| {
+                                TypeError::UnknownIdentifier {
                                     name: method_name.clone(),
                                     span: Some(field.span),
-                                })?;
+                                }
+                            })?;
                             let callee = self.instantiate(&scheme);
                             let mut full_args = vec![base_ty];
                             full_args.extend(arg_tys);
@@ -507,13 +597,12 @@ impl TypeChecker {
                         }
                     } else if let InferType::Con(type_name) = self.apply(&base_ty) {
                         let method_name = format!("__ty_method__{}__{}", type_name, field.name);
-                        let scheme = self
-                            .lookup(&method_name)
-                            .cloned()
-                            .ok_or_else(|| TypeError::UnknownIdentifier {
+                        let scheme = self.lookup(&method_name).cloned().ok_or_else(|| {
+                            TypeError::UnknownIdentifier {
                                 name: method_name.clone(),
                                 span: Some(field.span),
-                            })?;
+                            }
+                        })?;
                         let callee = self.instantiate(&scheme);
                         let mut full_args = vec![base_ty];
                         full_args.extend(arg_tys);
@@ -559,7 +648,10 @@ impl TypeChecker {
                                 .cloned()
                                 .unwrap_or_else(|| self.fresh_var())
                         } else if let Some(fields) = self.struct_fields.get(&name) {
-                            fields.get(&field.name).cloned().unwrap_or_else(|| self.fresh_var())
+                            fields
+                                .get(&field.name)
+                                .cloned()
+                                .unwrap_or_else(|| self.fresh_var())
                         } else {
                             self.fresh_var()
                         }
@@ -597,10 +689,17 @@ impl TypeChecker {
                 let left_ty = self.infer_expression(left)?;
                 let right_ty = self.infer_expression(right)?;
                 let ret = self.fresh_var();
-                self.unify(right_ty, InferType::Fn(vec![left_ty], Box::new(ret.clone())), Some(expr.span))?;
+                self.unify(
+                    right_ty,
+                    InferType::Fn(vec![left_ty], Box::new(ret.clone())),
+                    Some(expr.span),
+                )?;
                 ret
             }
-            ExpressionKind::Match { expr: scrutinee, arms } => {
+            ExpressionKind::Match {
+                expr: scrutinee,
+                arms,
+            } => {
                 let scrutinee_ty = self.infer_expression(scrutinee)?;
                 let arm_ty = self.fresh_var();
                 for arm in arms {
@@ -620,7 +719,12 @@ impl TypeChecker {
                 let inner_ty = self.infer_expression(inner)?;
                 self.try_inner_type(&inner_ty).unwrap_or(inner_ty)
             }
-            ExpressionKind::IfLet { pattern, expr: matched, then, else_branch } => {
+            ExpressionKind::IfLet {
+                pattern,
+                expr: matched,
+                then,
+                else_branch,
+            } => {
                 let matched_ty = self.infer_expression(matched)?;
                 self.push_scope();
                 self.bind_pattern(pattern, &matched_ty)?;
@@ -653,12 +757,30 @@ impl TypeChecker {
                 self.unify(left_ty.clone(), right_ty, Some(span))?;
                 Ok(left_ty)
             }
-            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Mod | Operator::Shl | Operator::Shr | Operator::BitAnd | Operator::BitOr | Operator::BitXor | Operator::AddAssign | Operator::SubAssign | Operator::MulAssign | Operator::DivAssign => {
+            Operator::Add
+            | Operator::Sub
+            | Operator::Mul
+            | Operator::Div
+            | Operator::Mod
+            | Operator::Shl
+            | Operator::Shr
+            | Operator::BitAnd
+            | Operator::BitOr
+            | Operator::BitXor
+            | Operator::AddAssign
+            | Operator::SubAssign
+            | Operator::MulAssign
+            | Operator::DivAssign => {
                 self.unify(left_ty.clone(), InferType::Con("Int32".into()), Some(span))?;
                 self.unify(right_ty, InferType::Con("Int32".into()), Some(span))?;
                 Ok(InferType::Con("Int32".into()))
             }
-            Operator::Eq | Operator::Ne | Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge => {
+            Operator::Eq
+            | Operator::Ne
+            | Operator::Lt
+            | Operator::Gt
+            | Operator::Le
+            | Operator::Ge => {
                 self.unify(left_ty, right_ty, Some(span))?;
                 Ok(InferType::Con("Bool".into()))
             }
@@ -683,7 +805,9 @@ impl TypeChecker {
                 self.unify(ty, expected.clone(), Some(pattern.span))
             }
             PatternKind::Tuple(parts) | PatternKind::Array(parts) => {
-                let elem = self.array_elem_type(expected).unwrap_or_else(|| self.fresh_var());
+                let elem = self
+                    .array_elem_type(expected)
+                    .unwrap_or_else(|| self.fresh_var());
                 for part in parts {
                     self.bind_pattern(part, &elem)?;
                 }
@@ -704,7 +828,11 @@ impl TypeChecker {
                 let guard_ty = self.infer_expression(guard)?;
                 self.unify(guard_ty, InferType::Con("Bool".into()), Some(guard.span))
             }
-            PatternKind::EnumVariant { variant_name, payload: Some(payload), .. } => {
+            PatternKind::EnumVariant {
+                variant_name,
+                payload: Some(payload),
+                ..
+            } => {
                 if let Some(inner) = result_variant_payload(expected, &variant_name.name) {
                     self.bind_pattern(payload, &inner)
                 } else {
@@ -762,15 +890,21 @@ impl TypeChecker {
 
     fn try_inner_type(&self, ty: &InferType) -> Option<InferType> {
         match self.apply(ty) {
-            InferType::App(name, args) if name == "Result" && args.len() == 2 => Some(args[0].clone()),
-            InferType::App(name, args) if name == "Option" && args.len() == 1 => Some(args[0].clone()),
+            InferType::App(name, args) if name == "Result" && args.len() == 2 => {
+                Some(args[0].clone())
+            }
+            InferType::App(name, args) if name == "Option" && args.len() == 1 => {
+                Some(args[0].clone())
+            }
             _ => None,
         }
     }
 
     fn array_elem_type(&self, ty: &InferType) -> Option<InferType> {
         match self.apply(ty) {
-            InferType::App(name, args) if name == "Array" && args.len() == 1 => Some(args[0].clone()),
+            InferType::App(name, args) if name == "Array" && args.len() == 1 => {
+                Some(args[0].clone())
+            }
             InferType::FixedArray(elem, _) => Some(*elem),
             _ => None,
         }
@@ -855,13 +989,25 @@ impl TypeChecker {
         self.instantiate_ty(&scheme.ty, &mapping)
     }
 
-    fn instantiate_ty(&mut self, ty: &InferType, mapping: &HashMap<TypeVarId, InferType>) -> InferType {
+    fn instantiate_ty(
+        &mut self,
+        ty: &InferType,
+        mapping: &HashMap<TypeVarId, InferType>,
+    ) -> InferType {
         match ty {
             InferType::Var(var) => mapping.get(var).cloned().unwrap_or(InferType::Var(*var)),
             InferType::Con(name) => InferType::Con(name.clone()),
-            InferType::App(name, args) => InferType::App(name.clone(), args.iter().map(|arg| self.instantiate_ty(arg, mapping)).collect()),
+            InferType::App(name, args) => InferType::App(
+                name.clone(),
+                args.iter()
+                    .map(|arg| self.instantiate_ty(arg, mapping))
+                    .collect(),
+            ),
             InferType::Fn(params, ret) => InferType::Fn(
-                params.iter().map(|param| self.instantiate_ty(param, mapping)).collect(),
+                params
+                    .iter()
+                    .map(|param| self.instantiate_ty(param, mapping))
+                    .collect(),
                 Box::new(self.instantiate_ty(ret, mapping)),
             ),
             InferType::FixedArray(elem, n) => {
@@ -883,7 +1029,10 @@ impl TypeChecker {
                 }
             }
         }
-        Scheme { vars: vars.into_iter().collect(), ty }
+        Scheme {
+            vars: vars.into_iter().collect(),
+            ty,
+        }
     }
 
     fn free_type_vars(&self, ty: &InferType) -> HashSet<TypeVarId> {
@@ -911,20 +1060,31 @@ impl TypeChecker {
 
     fn apply(&self, ty: &InferType) -> InferType {
         match ty {
-            InferType::Var(var) => self.subst.get(var).cloned().map(|t| self.apply(&t)).unwrap_or(InferType::Var(*var)),
+            InferType::Var(var) => self
+                .subst
+                .get(var)
+                .cloned()
+                .map(|t| self.apply(&t))
+                .unwrap_or(InferType::Var(*var)),
             InferType::Con(name) => InferType::Con(name.clone()),
-            InferType::App(name, args) => InferType::App(name.clone(), args.iter().map(|arg| self.apply(arg)).collect()),
+            InferType::App(name, args) => InferType::App(
+                name.clone(),
+                args.iter().map(|arg| self.apply(arg)).collect(),
+            ),
             InferType::Fn(params, ret) => InferType::Fn(
                 params.iter().map(|param| self.apply(param)).collect(),
                 Box::new(self.apply(ret)),
             ),
-            InferType::FixedArray(elem, n) => {
-                InferType::FixedArray(Box::new(self.apply(elem)), *n)
-            }
+            InferType::FixedArray(elem, n) => InferType::FixedArray(Box::new(self.apply(elem)), *n),
         }
     }
 
-    fn unify(&mut self, left: InferType, right: InferType, span: Option<Span>) -> Result<(), TypeError> {
+    fn unify(
+        &mut self,
+        left: InferType,
+        right: InferType,
+        span: Option<Span>,
+    ) -> Result<(), TypeError> {
         let left = self.apply(&left);
         let right = self.apply(&right);
         match (left, right) {
@@ -946,13 +1106,17 @@ impl TypeChecker {
             {
                 self.unify(args.remove(0), *b_elem, span)
             }
-            (InferType::App(a, a_args), InferType::App(b, b_args)) if a == b && a_args.len() == b_args.len() => {
+            (InferType::App(a, a_args), InferType::App(b, b_args))
+                if a == b && a_args.len() == b_args.len() =>
+            {
                 for (x, y) in a_args.into_iter().zip(b_args.into_iter()) {
                     self.unify(x, y, span)?;
                 }
                 Ok(())
             }
-            (InferType::Fn(a_params, a_ret), InferType::Fn(b_params, b_ret)) if a_params.len() == b_params.len() => {
+            (InferType::Fn(a_params, a_ret), InferType::Fn(b_params, b_ret))
+                if a_params.len() == b_params.len() =>
+            {
                 for (x, y) in a_params.into_iter().zip(b_params.into_iter()) {
                     self.unify(x, y, span)?;
                 }
@@ -967,7 +1131,12 @@ impl TypeChecker {
         }
     }
 
-    fn bind_var(&mut self, var: TypeVarId, ty: InferType, span: Option<Span>) -> Result<(), TypeError> {
+    fn bind_var(
+        &mut self,
+        var: TypeVarId,
+        ty: InferType,
+        span: Option<Span>,
+    ) -> Result<(), TypeError> {
         let ty = self.apply(&ty);
         if ty == InferType::Var(var) {
             return Ok(());
@@ -1005,6 +1174,11 @@ fn result_variant_payload(expected: &InferType, variant: &str) -> Option<InferTy
         InferType::App(name, args) if name == "Result" && args.len() == 2 => match variant {
             "Ok" => Some(args[0].clone()),
             "Err" => Some(args[1].clone()),
+            _ => None,
+        },
+        InferType::App(name, args) if name == "Option" && args.len() == 1 => match variant {
+            "Some" => Some(args[0].clone()),
+            "None" => None,
             _ => None,
         },
         _ => None,
@@ -1047,7 +1221,10 @@ mod tests {
 
     #[test]
     fn accepts_simple_function() {
-        assert!(check("fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }").is_ok());
+        assert!(check(
+            "fn compute(count: Int32) -> Int32 { let accumulator: Int32 = 0; return accumulator; }"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1089,7 +1266,8 @@ mod tests {
 
     #[test]
     fn array_push_is_unit() {
-        let source = "fn main() -> Int32 { let mut xs: Array<Int32> = [1,2]; xs.push(3); return 0; }";
+        let source =
+            "fn main() -> Int32 { let mut xs: Array<Int32> = [1,2]; xs.push(3); return 0; }";
         assert!(check(source).is_ok());
     }
 

@@ -270,9 +270,35 @@ impl LiveAnalyzer {
                 Ok(())
             }
             StatementKind::Conc { body } => {
-                let base = self.stack.clone();
-                let conc_stack = self.run_branch_block(body, base)?;
-                self.merge_branch_result(&conc_stack);
+                // Phase 1: find which outer bindings the conc body captures and consume them.
+                let captures = self.collect_free_identifiers(body);
+                for name in &captures {
+                    // consume_identifier already skips mutables and shared (ref) bindings
+                    for set in self.stack.iter_mut().rev() {
+                        if set.bindings.contains_key(name)
+                            || set.mutables.contains(name)
+                            || set.shared.contains(name)
+                        {
+                            let _ = set.consume(name, "conc capture");
+                            break;
+                        }
+                    }
+                }
+
+                // Phase 2: check the body in isolation with only the captured bindings in scope.
+                let mut capture_set = LiveSet::new();
+                for name in &captures {
+                    // Re-insert captured bindings as shared — inside the conc body they are
+                    // already "owned" by the closure; ref/non-ref distinction is resolved above.
+                    capture_set.shared.insert(name.clone());
+                }
+                let isolated_stack = vec![capture_set];
+                let mut body_analyzer = LiveAnalyzer {
+                    stack: isolated_stack,
+                    errors: Vec::new(),
+                    structured_drops: HashMap::new(),
+                };
+                body_analyzer.analyze_block_no_drops(body)?;
                 Ok(())
             }
             StatementKind::Loop { kind, body } => {
@@ -305,7 +331,7 @@ impl LiveAnalyzer {
                         // Strip the for-scope level we added — it isn't part of `base`
                         loop_stack.pop();
 
-                        self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                        self.ensure_loop_body_consistency(&base, &loop_stack, "loop")?;
                         self.merge_branch_result(&loop_stack);
                         return Ok(()); // skip the fallthrough pass on lines 281-283
                     }
@@ -315,7 +341,7 @@ impl LiveAnalyzer {
                     _ => {}
                 }
                 let loop_stack = self.run_branch_block(body, base.clone())?;
-                self.ensure_branch_consistency(&base, &loop_stack, &base, "loop")?;
+                self.ensure_loop_body_consistency(&base, &loop_stack, "loop")?;
                 self.merge_branch_result(&loop_stack);
                 Ok(())
             }
@@ -324,7 +350,7 @@ impl LiveAnalyzer {
                 let base = self.stack.clone();
                 let mut branch_results = Vec::new();
                 for arm in arms {
-                    let stack = self.run_branch_expr(&arm.node.body, base.clone())?;
+                    let stack = self.run_branch_match_arm(arm, base.clone())?;
                     branch_results.push(stack);
                 }
                 if let Some(first) = branch_results.first() {
@@ -384,7 +410,16 @@ impl LiveAnalyzer {
                 Ok(())
             }
             ExpressionKind::UnaryOp { expr, .. } => self.analyze_expression(expr),
-            ExpressionKind::FieldAccess { base, .. } => self.analyze_expression(base),
+            ExpressionKind::FieldAccess { base, .. } => {
+                // Accessing a field or calling a method on a binding is a borrow, not a move.
+                // Only recurse if the base itself is a complex expression that might contain
+                // sub-expressions that need consuming (e.g. a call result).
+                // A bare identifier as receiver must NOT be consumed.
+                match &base.node {
+                    ExpressionKind::Identifier(_) => Ok(()),
+                    _ => self.analyze_expression(base),
+                }
+            }
             ExpressionKind::IndexAccess { base, index } => {
                 self.analyze_expression(base)?;
                 self.analyze_expression(index)?;
@@ -402,7 +437,15 @@ impl LiveAnalyzer {
             ExpressionKind::Match { expr, arms } => {
                 self.analyze_expression(expr)?;
                 for arm in arms {
+                    // Match-arm patterns introduce new bindings that must be in-scope
+                    // for the arm's guard and body.
+                    self.push();
+                    self.insert_pattern_bindings(&arm.node.pattern, "match binding")?;
+                    if let Some(guard) = &arm.node.guard {
+                        self.analyze_expression(guard)?;
+                    }
                     self.analyze_expression(&arm.node.body)?;
+                    self.pop();
                 }
                 Ok(())
             }
@@ -470,7 +513,14 @@ impl LiveAnalyzer {
             }
             ExpressionKind::UnaryOp { expr, .. } => self.consume_identifiers_in_expression(expr),
             ExpressionKind::FieldAccess { base, .. } => {
-                self.consume_identifiers_in_expression(base)
+                // Accessing a field or calling a method on a binding is a borrow, not a move.
+                // Only recurse if the base itself is a complex expression that might contain
+                // sub-expressions that need consuming (e.g. a call result).
+                // A bare identifier as receiver must NOT be consumed.
+                match &base.node {
+                    ExpressionKind::Identifier(_) => Ok(()),
+                    _ => self.consume_identifiers_in_expression(base),
+                }
             }
             ExpressionKind::IndexAccess { base, index } => {
                 self.consume_identifiers_in_expression(base)?;
@@ -489,7 +539,15 @@ impl LiveAnalyzer {
             ExpressionKind::Match { expr, arms } => {
                 self.consume_identifiers_in_expression(expr)?;
                 for arm in arms {
+                    // Match-arm patterns introduce new bindings that must be in-scope
+                    // for the arm's guard and body.
+                    self.push();
+                    self.insert_pattern_bindings(&arm.node.pattern, "match binding")?;
+                    if let Some(guard) = &arm.node.guard {
+                        self.consume_identifiers_in_expression(guard)?;
+                    }
                     self.consume_identifiers_in_expression(&arm.node.body)?;
+                    self.pop();
                 }
                 Ok(())
             }
@@ -572,6 +630,95 @@ impl LiveAnalyzer {
         }
     }
 
+    fn collect_free_identifiers(&self, block: &Block) -> HashSet<String> {
+        let mut free = HashSet::new();
+        let mut bound = HashSet::new();
+        self.collect_free_in_block(block, &mut bound, &mut free);
+        // Remove names that aren't actually in the outer live set at all
+        free.retain(|name| {
+            self.stack.iter().any(|set| {
+                set.bindings.contains_key(name)
+                    || set.mutables.contains(name)
+                    || set.shared.contains(name)
+            })
+        });
+        free
+    }
+
+    fn collect_free_in_block(
+        &self,
+        block: &Block,
+        bound: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        for stmt in &block.statements {
+            self.collect_free_in_stmt(stmt, bound, free);
+        }
+        if let Some(expr) = &block.trailing_expression {
+            self.collect_free_in_expr(expr, bound, free);
+        }
+    }
+
+    fn collect_free_in_stmt(
+        &self,
+        stmt: &Statement,
+        bound: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        match &stmt.node {
+            StatementKind::LetBinding {
+                name, initializer, ..
+            } => {
+                self.collect_free_in_expr(initializer, bound, free);
+                bound.insert(name.name.clone()); // binding comes into scope after initializer
+            }
+            StatementKind::Expression(expr) | StatementKind::Return(Some(expr)) => {
+                self.collect_free_in_expr(expr, bound, free);
+            }
+            StatementKind::Loop { body, .. } | StatementKind::Conc { body } => {
+                self.collect_free_in_block(body, bound, free);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_free_in_expr(
+        &self,
+        expr: &Expression,
+        bound: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        match &expr.node {
+            ExpressionKind::Identifier(id) => {
+                if !bound.contains(&id.name) {
+                    free.insert(id.name.clone());
+                }
+            }
+            ExpressionKind::BinaryOp { left, right, .. } => {
+                self.collect_free_in_expr(left, bound, free);
+                self.collect_free_in_expr(right, bound, free);
+            }
+            ExpressionKind::FieldAccess { base, .. } => {
+                // Only the root identifier matters for capture; don't treat field name as free
+                self.collect_free_in_expr(base, bound, free);
+            }
+            ExpressionKind::Call { func, args } => {
+                self.collect_free_in_expr(func, bound, free);
+                for arg in args {
+                    self.collect_free_in_expr(arg, bound, free);
+                }
+            }
+            ExpressionKind::Match { expr, arms } => {
+                self.collect_free_in_expr(expr, bound, free);
+                for arm in arms {
+                    self.collect_free_in_expr(&arm.node.body, bound, free);
+                }
+            }
+            ExpressionKind::Block(block) => self.collect_free_in_block(block, bound, free),
+            _ => {}
+        }
+    }
+
     fn ensure_branch_consistency(
         &self,
         base: &[LiveSet],
@@ -589,6 +736,47 @@ impl LiveAnalyzer {
                 if then_binding.consumed != else_binding.consumed {
                     return Err(format!(
                         "Binding '{}' consumed inconsistently across branches in {}",
+                        name, context
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_loop_body_consistency(
+        &self,
+        base: &[LiveSet],
+        loop_stack: &[LiveSet],
+        context: &str,
+    ) -> Result<(), String> {
+        if base.len() != loop_stack.len() {
+            return Err(format!("Live-set depth mismatch in {}", context));
+        }
+        for (depth, base_set) in base.iter().enumerate() {
+            for (name, base_binding) in &base_set.bindings {
+                let after = loop_stack[depth].bindings.get(name).unwrap_or(base_binding);
+
+                // If it's a parameter, it's a copy.
+                if base_binding.origin == "parameter" {
+                    continue;
+                }
+
+                // If it is in any shared set (including the one we are iterating on),
+                // it's shared and thus safe.
+                // ALSO, for now, if it is a `ref` type, let's just allow it for all
+                // identifiers that were declared as `ref`.
+                // For now, I will just print the bindings that are causing trouble.
+
+                // A loop body must not consume a binding from the outer scope —
+                // the loop might run zero times, so the binding would escape unconsumed.
+                if !base_binding.consumed && after.consumed {
+                    // Check if it is shared in any set
+                    if base.iter().any(|s| s.shared.contains(name)) {
+                        continue;
+                    }
+                    return Err(format!(
+                        "Binding '{}' cannot be consumed inside a loop body in {}",
                         name, context
                     ));
                 }
@@ -626,6 +814,94 @@ impl LiveAnalyzer {
         // for now we accept all patterns without tracking their introduced names.
         Ok(())
     }
+
+    fn run_branch_match_arm(
+        &self,
+        arm: &MatchArm,
+        stack: Vec<LiveSet>,
+    ) -> Result<Vec<LiveSet>, String> {
+        let mut branch = LiveAnalyzer {
+            stack,
+            errors: Vec::new(),
+            structured_drops: HashMap::new(),
+        };
+
+        branch.push();
+        if let Err(err) = branch.insert_pattern_bindings(&arm.node.pattern, "match binding") {
+            branch.errors.push(err);
+        }
+        if let Some(guard) = &arm.node.guard {
+            if let Err(err) = branch.analyze_expression(guard) {
+                branch.errors.push(err);
+            }
+        }
+        if let Err(err) = branch.analyze_expression(&arm.node.body) {
+            branch.errors.push(err);
+        }
+        branch.pop();
+
+        if branch.errors.is_empty() {
+            Ok(branch.stack)
+        } else {
+            Err(branch.errors.join("; "))
+        }
+    }
+
+    fn insert_pattern_bindings(&mut self, pattern: &Pattern, origin: &str) -> Result<(), String> {
+        let mut binders: HashMap<String, Identifier> = HashMap::new();
+        self.collect_pattern_binders(pattern, &mut binders);
+        for (name, id) in binders {
+            // Identifier pattern acts like a value-pattern if name already exists in outer scope.
+            if self.name_in_outer_scopes(&name) {
+                continue;
+            }
+            self.insert_binding(&id, origin, false, false)?;
+        }
+        Ok(())
+    }
+
+    fn name_in_outer_scopes(&self, name: &str) -> bool {
+        if self.stack.len() < 2 {
+            return false;
+        }
+        self.stack[..self.stack.len() - 1].iter().any(|set| {
+            set.bindings.contains_key(name)
+                || set.mutables.contains(name)
+                || set.shared.contains(name)
+        })
+    }
+
+    fn collect_pattern_binders(&self, pattern: &Pattern, out: &mut HashMap<String, Identifier>) {
+        match &pattern.node {
+            PatternKind::Wildcard | PatternKind::Literal(_) => {}
+            PatternKind::Identifier(id) => {
+                out.entry(id.name.clone()).or_insert_with(|| id.clone());
+            }
+            PatternKind::EnumVariant { payload, .. } => {
+                if let Some(p) = payload {
+                    self.collect_pattern_binders(p, out);
+                }
+            }
+            PatternKind::Struct { fields, .. } => {
+                for (_field, p) in fields {
+                    self.collect_pattern_binders(p, out);
+                }
+            }
+            PatternKind::Tuple(items) | PatternKind::Array(items) => {
+                for p in items {
+                    self.collect_pattern_binders(p, out);
+                }
+            }
+            PatternKind::Or(a, b) => {
+                self.collect_pattern_binders(a, out);
+                self.collect_pattern_binders(b, out);
+            }
+            PatternKind::Guard { pattern, .. } => {
+                // The guard expression is analyzed separately at the match-arm level.
+                self.collect_pattern_binders(pattern, out);
+            }
+        }
+    }
 }
 
 fn format_span(span: Span) -> String {
@@ -633,7 +909,9 @@ fn format_span(span: Span) -> String {
 }
 
 fn is_ref_type(ty: &Type) -> bool {
-    ty.node.name.eq("ref")
+    // Parser canonicalizes `ref T` (and `&T`) to a type named "Ref".
+    // Keep accepting lowercase "ref" for any hand-constructed ASTs/tests.
+    matches!(ty.node.name.as_str(), "Ref" | "ref")
 }
 
 #[cfg(test)]
@@ -803,12 +1081,26 @@ mod tests {
             declarations: vec![mk_decl(DeclarationKind::Function {
                 name: mk_ident("looping"),
                 generics: vec![],
-                params: vec![mk_param("token", "Int32")],
+                params: vec![],
                 return_type: Some(mk_type("Int32")),
-                body: mk_block(vec![mk_stmt(StatementKind::Loop {
-                    kind: Spanned::new_dummy(LoopKindKind::Block(loop_body.clone()), dummy_span()),
-                    body: loop_body,
-                })]),
+                body: mk_block(vec![
+                    mk_stmt(StatementKind::LetBinding {
+                        mutable: false,
+                        name: mk_ident("token"),
+                        type_annotation: Some(mk_type("Int32")),
+                        initializer: mk_expr(ExpressionKind::Literal(Literal {
+                            kind: LiteralKind::Int(1, None),
+                            span: dummy_span(),
+                        })),
+                    }),
+                    mk_stmt(StatementKind::Loop {
+                        kind: Spanned::new_dummy(
+                            LoopKindKind::Block(loop_body.clone()),
+                            dummy_span(),
+                        ),
+                        body: loop_body,
+                    }),
+                ]),
             })],
             span: dummy_span(),
         };
@@ -900,7 +1192,7 @@ mod tests {
         // ref<Int32> parameter — needs a generic type arg
         let ref_type = Spanned::new_dummy(
             TypeKind {
-                name: "ref".into(),
+                name: "Ref".into(),
                 generic_args: vec![mk_type("Int32")],
             },
             dummy_span(),
@@ -943,7 +1235,7 @@ mod tests {
         };
         let ref_node_type = Spanned::new_dummy(
             TypeKind {
-                name: "ref".into(),
+                name: "Ref".into(),
                 generic_args: vec![mk_type("Node")],
             },
             dummy_span(),

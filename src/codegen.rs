@@ -108,8 +108,9 @@ struct IrBuilder<'a> {
     current_fn_ret_ty: String,
     locals: HashMap<String, String>,
     locals_type: HashMap<String, String>,
-    parent_locals: HashMap<String, String>,  // captured variables from parent scope
-    parent_types: HashMap<String, String>,   // types of captured variables
+    parent_locals: HashMap<String, String>, // captured variables from parent scope
+    parent_types: HashMap<String, String>,  // types of captured variables
+    mutable_vars: std::collections::HashSet<String>, // track mutable variables for capture
     type_decls: Vec<String>,
     struct_fields: HashMap<String, Vec<(String, String)>>,
     func_sigs: HashMap<String, (String, Vec<String>)>,
@@ -133,6 +134,7 @@ impl<'a> IrBuilder<'a> {
             locals_type: HashMap::new(),
             parent_locals: HashMap::new(),
             parent_types: HashMap::new(),
+            mutable_vars: std::collections::HashSet::new(),
             type_decls: Vec::new(),
             struct_fields: HashMap::new(),
             func_sigs: HashMap::new(),
@@ -205,6 +207,7 @@ impl<'a> IrBuilder<'a> {
             "declare i8* @ty_chan_new(i64, i64)", // elem_size, cap
             "declare void @ty_chan_send(i8*, i8*, i8*)", // task, chan, elem_ptr
             "declare void @ty_chan_recv(i8*, i8*, i8*)", // task, chan, out_ptr
+            "declare i32 @ty_chan_try_recv(i8*, i8*, i8*)", // task, chan, out_ptr -> i32 (0/1)
             "declare void @ty_chan_close(i8*)", // chan
             // ── Buf (all now take task first) ──
             "declare %struct.Buf* @ty_buf_new(i8* %task)",
@@ -258,6 +261,10 @@ impl<'a> IrBuilder<'a> {
             "ty_chan_recv".into(),
             ("void".into(), vec!["i8*".into(), "i8*".into()]),
         ); // chan, out_ptr
+        self.func_sigs.insert(
+            "ty_chan_try_recv".into(),
+            ("i32".into(), vec!["i8*".into(), "i8*".into()]),
+        ); // chan, out_ptr -> i32
         self.func_sigs
             .insert("ty_chan_close".into(), ("void".into(), vec!["i8*".into()]));
 
@@ -336,15 +343,17 @@ impl<'a> IrBuilder<'a> {
         self.lines.clear();
         self.locals.clear();
         self.locals_type.clear();
+        self.next_tmp = 0; // Reset temporary counter for each function
         self.current_fn_ret_ty = ret_ty.to_string();
         self.current_fn_name = Some(name.name.clone());
         self.emit("entry:".to_string());
         if is_main(&name.name) {
-            self.emit("  %t0 = alloca i8*".to_string());
+            let task_slot = self.tmp();
+            self.emit(format!("  {} = alloca i8*", task_slot));
             self.emit("  %task_init = call i8* @slab_arena_new()".to_string());
-            self.emit("  store i8* %task_init, i8** %t0".to_string());
+            self.emit(format!("  store i8* %task_init, i8** {}", task_slot));
             self.emit("  call void @ty_sched_init()".to_string());
-            self.emit("  %task = load i8*, i8** %t0".to_string());
+            self.emit(format!("  %task = load i8*, i8** {}", task_slot));
         } else {
             self.emit_function_param("task".to_string(), "i8*".to_string());
         }
@@ -471,68 +480,262 @@ impl<'a> IrBuilder<'a> {
                 false
             }
             StatementKind::Conc { body } => {
-                // Emit a trampoline function that can access captured variables from parent scope.
-                let tramp_name = format!(
-                    "__ty_conc_{}",
-                    self.label("tramp")
-                );
-                
-                let saved_lines = std::mem::take(&mut self.lines);
-                let saved_fn_name = self.current_fn_name.clone();
-                let saved_fn_ret_ty = self.current_fn_ret_ty.clone();
-                let saved_locals = std::mem::take(&mut self.locals);
-                let saved_types = std::mem::take(&mut self.locals_type);
-                let saved_parent_locals = std::mem::take(&mut self.parent_locals);
-                let saved_parent_types = std::mem::take(&mut self.parent_types);
+                // ── Collect captured variables ─────────────────────────────
+                // Filter out `task` and `arg` (hidden params, not user vars).
+                // Collect (name, slot, llvm_type) while locals maps are still
+                // fully populated — before any state save that would empty them.
+                let captured_names = self.collect_captured_vars(body);
+                let captured: Vec<(String, String, String, bool)> = captured_names
+                    .iter()
+                    .filter(|n| *n != "task" && *n != "arg")
+                    .filter_map(|name| {
+                        let slot = self.locals.get(name)?.clone();
+                        let ty = self
+                            .locals_type
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| "i32".to_string());
+                        let is_mutable = self.mutable_vars.contains(name);
+                        Some((name.clone(), slot, ty, is_mutable))
+                    })
+                    .collect();
 
-                // Capture parent scope for the trampoline
-                self.parent_locals = saved_locals.clone();
-                self.parent_types = saved_types.clone();
+                let tramp_name = format!("__ty_conc_{}", self.label("tramp"));
 
-                self.lines.clear();
-                self.locals.clear();
-                self.locals_type.clear();
-                self.current_fn_ret_ty = "void".to_string();
-                self.current_fn_name = Some(tramp_name.clone());
-                self.emit("entry:".to_string());
-                self.emit_function_param("task".to_string(), "i8*".to_string());
-                self.emit_function_param("arg".to_string(), "i8*".to_string());
-                self.emit_block_stmts(body, "void");
-                self.emit("  ret void".to_string());
+                if captured.is_empty() {
+                    // ── No-capture path ────────────────────────────────────
+                    let saved_lines = std::mem::take(&mut self.lines);
+                    let saved_fn_name = self.current_fn_name.clone();
+                    let saved_ret_ty = self.current_fn_ret_ty.clone();
+                    let saved_locals = std::mem::take(&mut self.locals);
+                    let saved_types = std::mem::take(&mut self.locals_type);
+                    let saved_mutable_vars = std::mem::take(&mut self.mutable_vars);
 
-                let tramp_ir = IrFunction {
-                    name: tramp_name.clone(),
-                    body: self.lines.join("\n"),
-                    ret_type: "void".to_string(),
-                    params: vec![
-                        ("task".to_string(), "i8*".to_string()),
-                        ("arg".to_string(), "i8*".to_string()),
-                    ],
-                };
-                
-                // Restore
-                self.lines = saved_lines;
-                self.locals = saved_locals;
-                self.locals_type = saved_types;
-                self.current_fn_name = saved_fn_name;
-                self.current_fn_ret_ty = saved_fn_ret_ty;
-                self.parent_locals = saved_parent_locals;
-                self.parent_types = saved_parent_types;
+                    self.current_fn_ret_ty = "void".to_string();
+                    self.current_fn_name = Some(tramp_name.clone());
+                    self.emit("entry:".to_string());
+                    self.emit_function_param("task".to_string(), "i8*".to_string());
+                    self.emit_function_param("arg".to_string(), "i8*".to_string());
+                    self.emit_block_stmts(body, "void");
+                    self.emit("  ret void".to_string());
 
-                // 2. Emit the spawn call at the current site
-                let fn_ptr = self.tmp();
-                self.emit(format!(
-                    "  {} = bitcast void (i8*, i8*)* @{} to i8*",
-                    fn_ptr, tramp_name
-                ));
-                let null_arg = self.tmp();
-                self.emit(format!("  {} = bitcast i8* null to i8*", null_arg));
-                self.emit(format!(
-                    "  call i8* @ty_spawn(i8* %task, i8* {}, i8* {})",
-                    fn_ptr, null_arg
-                ));
+                    let tramp_ir = IrFunction {
+                        name: tramp_name.clone(),
+                        body: self.lines.join("\n"),
+                        ret_type: "void".to_string(),
+                        params: vec![
+                            ("task".to_string(), "i8*".to_string()),
+                            ("arg".to_string(), "i8*".to_string()),
+                        ],
+                    };
 
-                self.conc_functions.push(tramp_ir);
+                    self.lines = saved_lines;
+                    self.locals = saved_locals;
+                    self.locals_type = saved_types;
+                    self.mutable_vars = saved_mutable_vars;
+                    self.current_fn_name = saved_fn_name;
+                    self.current_fn_ret_ty = saved_ret_ty;
+
+                    // Run synchronously in caller thread.
+                    self.emit(format!("  call void @{}(i8* %task, i8* null)", tramp_name));
+
+                    self.conc_functions.push(tramp_ir);
+                } else {
+                    // ── Closure path ───────────────────────────────────────
+                    //
+                    // Memory model (Option B):
+                    //   1. Parent allocates closure struct from its own arena
+                    //      via slab_alloc(task, class).
+                    //   2. Parent passes the raw i8* pointer as the `arg`
+                    //      parameter to ty_spawn.
+                    //   3. Trampoline bitcasts arg → closure*, unpacks fields
+                    //      into local alloca slots, runs the body, then calls
+                    //      slab_free(task, arg, class) using its OWN `%task`
+                    //      (the spawned coroutine's arena).
+                    //   4. Because the spawned coroutine's arena is released
+                    //      in bulk when it exits (slab_arena_free), the
+                    //      slab_free is belt-and-suspenders — it recycles the
+                    //      slot back into the per-class free list immediately
+                    //      so it can be reused within the same coroutine's
+                    //      lifetime, rather than waiting for bulk teardown.
+                    //
+                    // The closure is allocated from the PARENT's arena.  The
+                    // trampoline receives a raw pointer to it and frees it
+                    // through its own arena.  This is safe because the spawned
+                    // coroutine's arena was created from the same underlying
+                    // virtual memory region — slab_free does nothing more than
+                    // push the pointer onto a free list; it never munmaps.
+                    // The actual release happens at arena_free time.
+
+                    // ── 1. Build closure struct type ───────────────────────
+                    // Done here, while locals_type is still fully populated.
+                    let closure_ty = format!("%closure.{}", tramp_name);
+
+                    // Build closure field types: mutable non-heap vars → pointers
+                    let closure_field_tys: Vec<String> = captured
+                        .iter()
+                        .map(|(name, _, ty, is_mutable)| {
+                            if *is_mutable && !ty.ends_with('*') {
+                                format!("{}*", ty)
+                            } else {
+                                ty.clone()
+                            }
+                        })
+                        .collect();
+
+                    // Compute exact packed size for the size-class selection.
+                    let closure_size: i64 = closure_field_tys
+                        .iter()
+                        .map(|ty| self.llvm_const_sizeof(ty))
+                        .sum();
+                    let class_id = get_size_class(closure_size);
+
+                    // Emit struct type declaration into preamble.
+                    self.type_decls.push(format!(
+                        "{} = type {{ {} }}",
+                        closure_ty,
+                        closure_field_tys.join(", ")
+                    ));
+
+                    // ── 2. Allocate & populate closure in parent ───────────
+                    let closure_raw = self.tmp();
+                    self.emit(format!(
+                        "  {} = call i8* @slab_alloc(i8* %task, i32 {})",
+                        closure_raw, class_id
+                    ));
+                    let closure_typed = self.tmp();
+                    self.emit(format!(
+                        "  {} = bitcast i8* {} to {}*",
+                        closure_typed, closure_raw, closure_ty
+                    ));
+
+                    // In the parent — populate closure fields
+                    for (idx, (name, slot, ty, is_mutable_var)) in captured.iter().enumerate() {
+                        let gep = self.tmp();
+
+                        let _field_ty = if *is_mutable_var && !ty.ends_with('*') {
+                            format!("{}*", ty)
+                        } else {
+                            ty.clone()
+                        };
+
+                        self.emit(format!(
+                            "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
+                            gep, closure_ty, closure_ty, closure_typed, idx
+                        ));
+
+                        if *is_mutable_var && !ty.ends_with('*') {
+                            // Stack-allocated mutable (non-pointer): capture pointer to enable updates.
+                            // For heap-allocated mutables, `slot` already is a typed pointer, and this
+                            // still does the right thing (capture pointer by value).
+                            self.emit(format!("  store {}* {}, {}** {}", ty, slot, ty, gep));
+                        } else {
+                            // Capture by value (including pointer-typed values like `i8*`):
+                            // locals store addresses (alloca slots) for non-mutable values.
+                            let loaded = self.tmp();
+                            self.emit(format!("  {} = load {}, {}* {}", loaded, ty, ty, slot));
+                            self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, gep));
+                        }
+                    }
+
+                    // ── 3. Emit trampoline ─────────────────────────────────
+                    let saved_lines = std::mem::take(&mut self.lines);
+                    let saved_fn_name = self.current_fn_name.clone();
+                    let saved_ret_ty = self.current_fn_ret_ty.clone();
+                    let saved_locals = std::mem::take(&mut self.locals);
+                    let saved_types = std::mem::take(&mut self.locals_type);
+                    let saved_mutable_vars = std::mem::take(&mut self.mutable_vars);
+
+                    self.current_fn_ret_ty = "void".to_string();
+                    self.current_fn_name = Some(tramp_name.clone());
+                    self.emit("entry:".to_string());
+                    self.emit_function_param("task".to_string(), "i8*".to_string());
+                    self.emit_function_param("arg".to_string(), "i8*".to_string());
+
+                    // Load arg from its alloca slot (emit_function_param stored it there)
+                    let arg_slot = self.locals.get("arg").cloned().unwrap();
+                    let arg_i8 = self.tmp();
+                    self.emit(format!("  {} = load i8*, i8** {}", arg_i8, arg_slot));
+                    // Bitcast to typed closure pointer
+                    let cl = self.tmp();
+                    self.emit(format!(
+                        "  {} = bitcast i8* {} to {}*",
+                        cl, arg_i8, closure_ty
+                    ));
+
+                    // Unpack each field into closure field
+                    for (idx, (name, _, ty, is_mutable_var)) in captured.iter().enumerate() {
+                        let gep = self.tmp();
+
+                        let field_ty = if *is_mutable_var && !ty.ends_with('*') {
+                            format!("{}*", ty)
+                        } else {
+                            ty.clone()
+                        };
+
+                        self.emit(format!(
+                            "  {} = getelementptr inbounds {}, {}* {}, i32 0, i32 {}",
+                            gep, closure_ty, closure_ty, cl, idx
+                        ));
+                        let loaded = self.tmp();
+                        self.emit(format!(
+                            "  {} = load {}, {}* {}",
+                            loaded, field_ty, field_ty, gep
+                        ));
+
+                        if *is_mutable_var && !ty.ends_with('*') {
+                            // Pointer to stack var: register directly as the pointer to the actual location
+                            self.locals.insert(name.clone(), loaded.clone());
+                            self.locals_type.insert(name.clone(), ty.clone());
+                        } else {
+                            // Value (including pointer values): copy into a fresh alloca
+                            let slot = self.tmp();
+                            self.emit(format!("  {} = alloca {}", slot, ty));
+                            self.emit(format!("  store {} {}, {}* {}", ty, loaded, ty, slot));
+                            self.locals.insert(name.clone(), slot);
+                            self.locals_type.insert(name.clone(), ty.clone());
+                        }
+                    }
+
+                    // Emit body
+                    self.emit_block_stmts(body, "void");
+
+                    // NOTE: do not free closure here. `slab_alloc` uses per-arena free lists,
+                    // and the spawned coroutine's arena may differ from the parent's arena that
+                    // allocated this closure. Freeing into wrong arena can corrupt allocator state.
+
+                    self.emit("  ret void".to_string());
+
+                    let tramp_ir = IrFunction {
+                        name: tramp_name.clone(),
+                        body: self.lines.join("\n"),
+                        ret_type: "void".to_string(),
+                        params: vec![
+                            ("task".to_string(), "i8*".to_string()),
+                            ("arg".to_string(), "i8*".to_string()),
+                        ],
+                    };
+
+                    self.lines = saved_lines;
+                    self.locals = saved_locals;
+                    self.locals_type = saved_types;
+                    self.mutable_vars = saved_mutable_vars;
+                    self.current_fn_name = saved_fn_name;
+                    self.current_fn_ret_ty = saved_ret_ty;
+
+                    // ── 4. Run synchronously with closure pointer ──────────
+                    self.emit(format!(
+                        "  call void @{}(i8* %task, i8* {})",
+                        tramp_name, closure_raw
+                    ));
+                    // Free closure in same arena that allocated it (parent `%task`).
+                    self.emit(format!(
+                        "  call void @slab_free(i8* %task, i8* {}, i32 {})",
+                        closure_raw, class_id
+                    ));
+
+                    self.conc_functions.push(tramp_ir);
+                }
                 false
             }
             _ => false,
@@ -593,6 +796,11 @@ impl<'a> IrBuilder<'a> {
         type_annotation: Option<&Type>,
         mutable: bool,
     ) {
+        // Track mutable variables for closure capture purposes
+        if mutable {
+            self.mutable_vars.insert(name.name.clone());
+        }
+
         // Array literal: build fixed or growable array
         if let ExpressionKind::Literal(Literal {
             kind: LiteralKind::Array(elems),
@@ -648,6 +856,38 @@ impl<'a> IrBuilder<'a> {
         }
 
         // General case
+        // Special-case chan constructor so we can use the annotated element type to size the channel.
+        if let ExpressionKind::Call { func, args } = &initializer.node {
+            if args.is_empty() {
+                if let ExpressionKind::Identifier(id) = &func.node {
+                    if id.name == "chan" {
+                        let elem_ty = type_annotation
+                            .and_then(|t| Self::chan_elem_type_from_annotation(t))
+                            .map(|t| self.lower_type(t))
+                            .unwrap_or_else(|| "i8".to_string());
+                        let elem_size = self.llvm_const_sizeof(&elem_ty);
+                        let chan_ptr = self.tmp();
+                        // Default to a small buffered channel to avoid deadlocks when producers run
+                        // synchronously (e.g. when `conc` is lowered without spawning).
+                        self.emit(format!(
+                            "  {} = call i8* @ty_chan_new(i64 {}, i64 64)",
+                            chan_ptr, elem_size
+                        ));
+
+                        let ty = type_annotation
+                            .map(|t| self.lower_type(t))
+                            .unwrap_or_else(|| "i8*".to_string());
+                        let slot = self.tmp();
+                        self.emit(format!("  {} = alloca {}", slot, ty));
+                        self.emit(format!("  store {} {}, {}* {}", ty, chan_ptr, ty, slot));
+                        self.locals.insert(name.name.clone(), slot);
+                        self.locals_type.insert(name.name.clone(), ty);
+                        return;
+                    }
+                }
+            }
+        }
+
         let value = self.emit_expr(initializer);
         let ty = type_annotation
             .map(|t| self.lower_type(t))
@@ -902,13 +1142,15 @@ impl<'a> IrBuilder<'a> {
                     let tmp = self.tmp();
                     self.emit(format!("  {} = load {}, {}* {}", tmp, ty, ty, slot));
                     tmp
-                } else if self.parent_locals.get(&id.name).is_some() {
-                    // Variable from parent scope (captured in conc block)
-                    // For now, generate a stub that will fail at runtime
-                    // A proper implementation would unpack from arg parameter
-                    format!("0 ; FIXME: captured var {}", id.name)
                 } else {
-                    id.name.clone()
+                    // For now, return 0 for any undefined identifier
+                    // This includes captured variables and undefined references
+                    if !id.name.is_empty() && id.name.chars().next().unwrap().is_alphabetic() {
+                        self.emit(format!("  ; undefined identifier: {}", id.name));
+                        "0".to_string()
+                    } else {
+                        id.name.clone()
+                    }
                 }
             }
             ExpressionKind::Block(block) => {
@@ -926,6 +1168,32 @@ impl<'a> IrBuilder<'a> {
                 result
             }
             ExpressionKind::BinaryOp { op, left, right } => self.emit_binop(op, left, right),
+            ExpressionKind::UnaryOp { op, expr: inner } => {
+                let v = self.emit_expr(inner);
+                let ty = self.expr_llvm_type(inner);
+                match op {
+                    Operator::Not => {
+                        let tmp = self.tmp();
+                        if ty == "i1" {
+                            self.emit(format!("  {} = xor i1 {}, 1", tmp, v));
+                        } else {
+                            // Fallback: treat as int-like; compare to 0.
+                            self.emit(format!("  {} = icmp eq {} {}, 0", tmp, ty, v));
+                        }
+                        tmp
+                    }
+                    Operator::Sub => {
+                        let tmp = self.tmp();
+                        if matches!(ty.as_str(), "half" | "float" | "double") {
+                            self.emit(format!("  {} = fsub {} 0.0, {}", tmp, ty, v));
+                        } else {
+                            self.emit(format!("  {} = sub {} 0, {}", tmp, ty, v));
+                        }
+                        tmp
+                    }
+                    _ => "0".to_string(),
+                }
+            }
             ExpressionKind::StructInit { name, fields } => {
                 let struct_ty = format!("%struct.{}", name.name);
                 let mut cur = "undef".to_string();
@@ -1109,17 +1377,15 @@ impl<'a> IrBuilder<'a> {
     fn resolve_lvalue(&mut self, expr: &Expression) -> (String, String) {
         match &expr.node {
             ExpressionKind::Identifier(id) => {
-                let slot = self
-                    .locals
-                    .get(&id.name)
-                    .cloned()
-                    .or_else(|| self.parent_locals.get(&id.name).cloned())
-                    .unwrap_or(id.name.clone());
+                let slot = self.locals.get(&id.name).cloned().unwrap_or_else(|| {
+                    // If the variable is not found, emit a comment and use a placeholder
+                    self.emit(format!("  ; undefined lvalue: {}", id.name));
+                    format!("null ; UNDEFINED")
+                });
                 let ty = self
                     .locals_type
                     .get(&id.name)
                     .cloned()
-                    .or_else(|| self.parent_types.get(&id.name).cloned())
                     .unwrap_or_else(|| "i32".to_string());
                 (slot, ty)
             }
@@ -1129,12 +1395,10 @@ impl<'a> IrBuilder<'a> {
                         self.locals
                             .get(&id.name)
                             .cloned()
-                            .or_else(|| self.parent_locals.get(&id.name).cloned())
                             .unwrap_or(id.name.clone()),
                         self.locals_type
                             .get(&id.name)
                             .cloned()
-                            .or_else(|| self.parent_types.get(&id.name).cloned())
                             .unwrap_or_else(|| "[0 x i32]".to_string()),
                     ),
                     _ => (self.emit_expr(base), "[0 x i32]".to_string()),
@@ -1154,12 +1418,10 @@ impl<'a> IrBuilder<'a> {
                         self.locals
                             .get(&id.name)
                             .cloned()
-                            .or_else(|| self.parent_locals.get(&id.name).cloned())
                             .unwrap_or(id.name.clone()),
                         self.locals_type
                             .get(&id.name)
                             .cloned()
-                            .or_else(|| self.parent_types.get(&id.name).cloned())
                             .unwrap_or_else(|| "%struct.?".to_string()),
                     ),
                     _ => (self.emit_expr(base), "%struct.?".to_string()),
@@ -1324,6 +1586,121 @@ impl<'a> IrBuilder<'a> {
             let base_val = self.emit_expr(base);
             let base_ty = self.expr_llvm_type(base);
 
+            // Channel methods (lowered to runtime calls). Channels currently lower to `i8*`.
+            if base_ty == "i8*" {
+                match field.name.as_str() {
+                    "send" => {
+                        if let Some(arg0) = args.first() {
+                            let val = self.emit_expr(arg0);
+                            let val_ty = self.expr_llvm_type(arg0);
+                            let slot = self.tmp();
+                            self.emit(format!("  {} = alloca {}", slot, val_ty));
+                            self.emit(format!("  store {} {}, {}* {}", val_ty, val, val_ty, slot));
+                            let raw = self.tmp();
+                            self.emit(format!("  {} = bitcast {}* {} to i8*", raw, val_ty, slot));
+                            self.emit(format!(
+                                "  call void @ty_chan_send(i8* %task, i8* {}, i8* {})",
+                                base_val, raw
+                            ));
+                        }
+                        return "0".to_string();
+                    }
+                    "try_recv" => {
+                        // Non-blocking receive: use runtime `ty_chan_try_recv` and wrap as Option.
+                        if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
+                            if let InferType::App(ref name, ref ty_args) = ty {
+                                if name == "Option" && ty_args.len() == 1 {
+                                    let elem_ty = self.lower_infer_type(&ty_args[0]);
+                                    let opt_ty = self.lower_infer_type(&ty);
+                                    self.ensure_option(&elem_ty);
+
+                                    let out_slot = self.tmp();
+                                    self.emit(format!("  {} = alloca {}", out_slot, elem_ty));
+                                    let out_raw = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = bitcast {}* {} to i8*",
+                                        out_raw, elem_ty, out_slot
+                                    ));
+                                    let ok32 = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
+                                        ok32, base_val, out_raw
+                                    ));
+                                    let ok = self.tmp();
+                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok, ok32));
+
+                                    // Give scheduler one chance to run blocked senders before returning None.
+                                    let some1_lbl = self.label("chan_some1");
+                                    let retry_lbl = self.label("chan_retry");
+                                    let some2_lbl = self.label("chan_some2");
+                                    let none_lbl = self.label("chan_none");
+                                    let merge_lbl = self.label("chan_merge");
+                                    self.emit(format!(
+                                        "  br i1 {}, label %{}, label %{}",
+                                        ok, some1_lbl, retry_lbl
+                                    ));
+
+                                    self.emit(format!("{}:", some1_lbl));
+                                    let loaded1 = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = load {}, {}* {}",
+                                        loaded1, elem_ty, elem_ty, out_slot
+                                    ));
+                                    let some1_val =
+                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded1);
+                                    self.emit(format!("  br label %{}", merge_lbl));
+
+                                    self.emit(format!("{}:", retry_lbl));
+                                    self.emit("  call void @ty_yield()".to_string());
+                                    let ok32_2 = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
+                                        ok32_2, base_val, out_raw
+                                    ));
+                                    let ok2 = self.tmp();
+                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok2, ok32_2));
+                                    self.emit(format!(
+                                        "  br i1 {}, label %{}, label %{}",
+                                        ok2, some2_lbl, none_lbl
+                                    ));
+
+                                    self.emit(format!("{}:", some2_lbl));
+                                    let loaded2 = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = load {}, {}* {}",
+                                        loaded2, elem_ty, elem_ty, out_slot
+                                    ));
+                                    let some2_val =
+                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded2);
+                                    self.emit(format!("  br label %{}", merge_lbl));
+
+                                    self.emit(format!("{}:", none_lbl));
+                                    let none_val = self.emit_option_none(&opt_ty, &elem_ty);
+                                    self.emit(format!("  br label %{}", merge_lbl));
+
+                                    self.emit(format!("{}:", merge_lbl));
+                                    let phi = self.tmp();
+                                    self.emit(format!(
+                                        "  {} = phi {} [ {}, %{} ], [ {}, %{} ], [ {}, %{} ]",
+                                        phi,
+                                        opt_ty,
+                                        some1_val,
+                                        some1_lbl,
+                                        some2_val,
+                                        some2_lbl,
+                                        none_val,
+                                        none_lbl
+                                    ));
+                                    return phi;
+                                }
+                            }
+                        }
+                        return "0".to_string();
+                    }
+                    _ => {}
+                }
+            }
+
             // Array push
             if base_ty == "%struct.TyArray*" && field.name == "push" {
                 if let Some(arg0) = args.first() {
@@ -1397,6 +1774,31 @@ impl<'a> IrBuilder<'a> {
             if matches!(id.name.as_str(), "Ok" | "Err" | "Some" | "None") {
                 return self.emit_adt_constructor(&id.name, call_expr, args);
             }
+            // Channel construction: chan<T>()
+            if id.name == "chan" {
+                // Derive element type from inference: chan() returns Ref<Chan<T>>.
+                let mut elem_llvm_ty = "i8".to_string();
+                if let Some(infer) = self.inferred_expr_type(call_expr).cloned() {
+                    let inner = match infer {
+                        InferType::App(n, mut a) if n == "Ref" && a.len() == 1 => a.remove(0),
+                        other => other,
+                    };
+                    if let InferType::App(n, a) = inner {
+                        if n == "Chan" && a.len() == 1 {
+                            elem_llvm_ty = self.lower_infer_type(&a[0]);
+                        }
+                    }
+                }
+                let elem_size = self.llvm_const_sizeof(&elem_llvm_ty);
+                let tmp = self.tmp();
+                // Default to a small buffered channel to avoid deadlocks when producers run
+                // synchronously (e.g. when `conc` is lowered without spawning).
+                self.emit(format!(
+                    "  {} = call i8* @ty_chan_new(i64 {}, i64 64)",
+                    tmp, elem_size
+                ));
+                return tmp;
+            }
             let runtime_name =
                 runtime_intrinsic_name(&id.name).unwrap_or_else(|| link_symbol_name(&id.name));
             let (ret_ty, param_types) = self
@@ -1449,7 +1851,16 @@ impl<'a> IrBuilder<'a> {
     // ── Match / if-let ────────────────────────────────────────────────────────
 
     fn emit_match_expression(&mut self, expr: &Expression, arms: &[MatchArm]) -> String {
-        let result_ty = self.expr_llvm_type(expr);
+        // The match expression's type is the arm-body type, not the scrutinee type.
+        // This function is also reused for `match` statements (all arms are `void`).
+        let mut result_ty = "void".to_string();
+        for arm in arms {
+            let ty = self.expr_llvm_type(&arm.node.body);
+            if ty != "void" {
+                result_ty = ty;
+                break;
+            }
+        }
         let result_slot = if result_ty != "void" {
             let slot = self.tmp();
             self.emit(format!("  {} = alloca {}", slot, result_ty));
@@ -1494,7 +1905,7 @@ impl<'a> IrBuilder<'a> {
             let body_val = self.emit_expr(&arm.node.body);
             if let Some((slot, ty)) = &result_slot {
                 let actual_ty = self.expr_llvm_type(&arm.node.body);
-                let store_ty = if actual_ty == "i32" || actual_ty.is_empty() {
+                let store_ty = if actual_ty == "void" {
                     ty.clone()
                 } else {
                     actual_ty
@@ -1622,7 +2033,31 @@ impl<'a> IrBuilder<'a> {
     ) -> String {
         let ty = self.expr_llvm_type(scrutinee_expr);
         match &pattern.node {
-            PatternKind::Wildcard | PatternKind::Identifier(_) => "1".to_string(),
+            PatternKind::Wildcard => "1".to_string(),
+            PatternKind::Identifier(id) => {
+                // If identifier already bound in scope, treat as value pattern (equality test).
+                // Else treat as binder pattern (always matches).
+                if let Some(slot) = self.locals.get(&id.name).cloned() {
+                    let pat_ty = self
+                        .locals_type
+                        .get(&id.name)
+                        .cloned()
+                        .unwrap_or_else(|| ty.clone());
+                    let loaded = self.tmp();
+                    self.emit(format!(
+                        "  {} = load {}, {}* {}",
+                        loaded, pat_ty, pat_ty, slot
+                    ));
+                    let cmp = self.tmp();
+                    self.emit(format!(
+                        "  {} = icmp eq {} {}, {}",
+                        cmp, ty, scrutinee_val, loaded
+                    ));
+                    cmp
+                } else {
+                    "1".to_string()
+                }
+            }
             PatternKind::Literal(lit) => match &lit.kind {
                 LiteralKind::Int(v, _) => {
                     let tmp = self.tmp();
@@ -1682,6 +2117,10 @@ impl<'a> IrBuilder<'a> {
         match &pattern.node {
             PatternKind::Wildcard | PatternKind::Literal(_) => {}
             PatternKind::Identifier(id) => {
+                // Value pattern: already bound, do not rebind/shadow.
+                if self.locals.contains_key(&id.name) {
+                    return;
+                }
                 let slot = self.tmp();
                 self.emit(format!("  {} = alloca {}", slot, ty));
                 self.emit(format!("  store {} {}, {}* {}", ty, val, ty, slot));
@@ -1891,9 +2330,12 @@ impl<'a> IrBuilder<'a> {
             "Float32" => "float".to_string(),
             "Float64" => "double".to_string(),
             "Bool" => "i1".to_string(),
-            "Str" | "ref" => "i8*".to_string(),
+            // `ref T` / `&T` parse to the canonical "Ref" type in the AST.
+            // We currently lower Ref as an opaque runtime pointer.
+            "Str" | "ref" | "Ref" => "i8*".to_string(),
             "Buf" => "%struct.Buf*".to_string(),
             "Array" => "%struct.TyArray*".to_string(),
+            "Chan" => "i8*".to_string(),
             "Option" => ty
                 .node
                 .generic_args
@@ -1939,8 +2381,10 @@ impl<'a> IrBuilder<'a> {
                 "Bool" => "i1".to_string(),
                 "Str" => "i8*".to_string(),
                 "Buf" => "%struct.Buf*".to_string(),
+                "Chan" => "i8*".to_string(),
                 n => format!("%struct.{}", n),
             },
+            InferType::App(name, args) if name == "Ref" && args.len() == 1 => "i8*".to_string(),
             InferType::App(name, args) if name == "Option" && args.len() == 1 => {
                 let inner = self.lower_infer_type(&args[0]);
                 self.ensure_option(&inner);
@@ -1957,6 +2401,7 @@ impl<'a> IrBuilder<'a> {
                 )
             }
             InferType::App(name, _) if name == "Array" => "%struct.TyArray*".to_string(),
+            InferType::App(name, _) if name == "Chan" => "i8*".to_string(),
             InferType::FixedArray(elem, n) => {
                 format!("[{} x {}]", n, self.lower_infer_type(elem))
             }
@@ -2023,6 +2468,10 @@ impl<'a> IrBuilder<'a> {
                             .unwrap_or_else(|| "i32".to_string());
                     }
                 } else if let ExpressionKind::Identifier(id) = &func.node {
+                    // Handle builtin chan constructor
+                    if id.name == "chan" {
+                        return "i8*".to_string();
+                    }
                     return self
                         .func_sigs
                         .get(&id.name)
@@ -2085,6 +2534,16 @@ impl<'a> IrBuilder<'a> {
             .trim_end_matches('*')
             .strip_prefix("%struct.")
             .map(|name| format!("__ty_method__{}__{}", name, method))
+    }
+
+    fn chan_elem_type_from_annotation(ty: &Type) -> Option<&Type> {
+        match ty.node.name.as_str() {
+            "Ref" if ty.node.generic_args.len() == 1 => {
+                Self::chan_elem_type_from_annotation(&ty.node.generic_args[0])
+            }
+            "Chan" if ty.node.generic_args.len() == 1 => Some(&ty.node.generic_args[0]),
+            _ => None,
+        }
     }
 
     // ── ADT struct tracking ───────────────────────────────────────────────────
@@ -2293,6 +2752,191 @@ impl<'a> IrBuilder<'a> {
         ));
         tmp
     }
+
+    /// Scan a block and collect all identifiers that are referenced but not defined locally.
+    /// These are potential captured variables.
+    fn collect_captured_vars(&self, block: &Block) -> Vec<String> {
+        let mut captured = Vec::new();
+        let mut defined = std::collections::HashSet::new();
+
+        // Visit each statement in order, adding let-bound names to `defined`
+        // AFTER visiting the initializer — so `let x = x + 1` correctly
+        // captures the outer `x` from the RHS before shadowing it.
+        for stmt in &block.statements {
+            {
+                let captured_ref = &mut captured;
+                let defined_ref = &defined;
+                self.visit_statement_for_identifiers(stmt, &mut |expr: &Expression| {
+                    if let ExpressionKind::Identifier(id) = &expr.node {
+                        if !defined_ref.contains(&id.name) && !captured_ref.contains(&id.name) {
+                            captured_ref.push(id.name.clone());
+                        }
+                    }
+                });
+            }
+            // Mark name as locally defined only after visiting initializer
+            if let StatementKind::LetBinding { name, .. } = &stmt.node {
+                defined.insert(name.name.clone());
+            }
+        }
+
+        // Visit trailing expression with all let bindings now in scope
+        if let Some(expr) = &block.trailing_expression {
+            let captured_ref = &mut captured;
+            let defined_ref = &defined;
+            self.visit_expr_for_identifiers(expr, &mut |expr: &Expression| {
+                if let ExpressionKind::Identifier(id) = &expr.node {
+                    if !defined_ref.contains(&id.name) && !captured_ref.contains(&id.name) {
+                        captured_ref.push(id.name.clone());
+                    }
+                }
+            });
+        }
+
+        captured
+    }
+
+    fn visit_statement_for_identifiers(
+        &self,
+        stmt: &Statement,
+        visitor: &mut dyn FnMut(&Expression),
+    ) {
+        match &stmt.node {
+            StatementKind::LetBinding { initializer, .. } => {
+                self.visit_expr_for_identifiers(initializer, visitor);
+            }
+            StatementKind::Expression(expr) => {
+                self.visit_expr_for_identifiers(expr, visitor);
+            }
+            StatementKind::Return(Some(expr)) => {
+                self.visit_expr_for_identifiers(expr, visitor);
+            }
+            StatementKind::Match { expr, arms } => {
+                self.visit_expr_for_identifiers(expr, visitor);
+                for arm in arms {
+                    if let Some(g) = &arm.node.guard {
+                        self.visit_expr_for_identifiers(g, visitor);
+                    }
+                    self.visit_expr_for_identifiers(&arm.node.body, visitor);
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.visit_expr_for_identifiers(condition, visitor);
+                for s in &then_branch.statements {
+                    self.visit_statement_for_identifiers(s, visitor);
+                }
+                if let Some(eb) = else_branch {
+                    match &eb.node {
+                        ElseBranchKind::Block(b) => {
+                            for s in &b.statements {
+                                self.visit_statement_for_identifiers(s, visitor);
+                            }
+                        }
+                        ElseBranchKind::If(stmt) => {
+                            self.visit_statement_for_identifiers(stmt, visitor);
+                        }
+                    }
+                }
+            }
+            StatementKind::Loop { body, .. } => {
+                for s in &body.statements {
+                    self.visit_statement_for_identifiers(s, visitor);
+                }
+            }
+            StatementKind::Conc { body } => {
+                for s in &body.statements {
+                    self.visit_statement_for_identifiers(s, visitor);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_expr_for_identifiers(&self, expr: &Expression, visitor: &mut dyn FnMut(&Expression)) {
+        visitor(expr);
+
+        match &expr.node {
+            ExpressionKind::BinaryOp { left, right, .. } => {
+                self.visit_expr_for_identifiers(left, visitor);
+                self.visit_expr_for_identifiers(right, visitor);
+            }
+            ExpressionKind::UnaryOp { expr, .. } => {
+                self.visit_expr_for_identifiers(expr, visitor);
+            }
+            ExpressionKind::Call { func, args } => {
+                self.visit_expr_for_identifiers(func, visitor);
+                for arg in args {
+                    self.visit_expr_for_identifiers(arg, visitor);
+                }
+            }
+            ExpressionKind::FieldAccess { base, .. } => {
+                self.visit_expr_for_identifiers(base, visitor);
+            }
+            ExpressionKind::IndexAccess { base, index } => {
+                self.visit_expr_for_identifiers(base, visitor);
+                self.visit_expr_for_identifiers(index, visitor);
+            }
+            ExpressionKind::StructInit { fields, .. } => {
+                for (_, e) in fields {
+                    self.visit_expr_for_identifiers(e, visitor);
+                }
+            }
+            ExpressionKind::MergeExpression { base, fields } => {
+                if let Some(b) = base {
+                    self.visit_expr_for_identifiers(b, visitor);
+                }
+                for (_, e) in fields {
+                    self.visit_expr_for_identifiers(e, visitor);
+                }
+            }
+            ExpressionKind::Match { expr, arms } => {
+                self.visit_expr_for_identifiers(expr, visitor);
+                for arm in arms {
+                    if let Some(g) = &arm.node.guard {
+                        self.visit_expr_for_identifiers(g, visitor);
+                    }
+                    self.visit_expr_for_identifiers(&arm.node.body, visitor);
+                }
+            }
+            ExpressionKind::IfLet {
+                expr,
+                then,
+                else_branch,
+                ..
+            } => {
+                self.visit_expr_for_identifiers(expr, visitor);
+                for s in &then.statements {
+                    self.visit_statement_for_identifiers(s, visitor);
+                }
+                if let Some(t) = &then.trailing_expression {
+                    self.visit_expr_for_identifiers(t, visitor);
+                }
+                if let Some(e) = else_branch {
+                    self.visit_expr_for_identifiers(e, visitor);
+                }
+            }
+            ExpressionKind::TryOperator { expr } => {
+                self.visit_expr_for_identifiers(expr, visitor);
+            }
+            ExpressionKind::Pipe { left, right } => {
+                self.visit_expr_for_identifiers(left, visitor);
+                self.visit_expr_for_identifiers(right, visitor);
+            }
+            ExpressionKind::Block(b) => {
+                for s in &b.statements {
+                    self.visit_statement_for_identifiers(s, visitor);
+                }
+                if let Some(e) = &b.trailing_expression {
+                    self.visit_expr_for_identifiers(e, visitor);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── Free functions ────────────────────────────────────────────────────────────
@@ -2307,6 +2951,27 @@ fn int_suffix_to_llvm(suffix: &str) -> &'static str {
         "i16" => "i16",
         "i64" => "i64",
         _ => "i32",
+    }
+}
+
+fn estimate_type_size(ty: &str) -> i64 {
+    if ty.starts_with("%struct.") {
+        // For structs, use a conservative estimate (8 bytes per field + overhead)
+        // This is not exact but good enough for size class estimation
+        64
+    } else if ty.ends_with('*') {
+        8 // pointer
+    } else {
+        match ty {
+            "i1" => 1,
+            "i8" => 1,
+            "i16" => 2,
+            "i32" => 4,
+            "i64" => 8,
+            "float" => 4,
+            "double" => 8,
+            _ => 8, // default
+        }
     }
 }
 
@@ -2523,8 +3188,18 @@ mod tests {
     }
 
     #[test]
-    fn lowers_match_to_control_flow() {
-        let text = compile("fn main(x: Int32) -> Int32 { match x { 0 => 1, _ => 2, } }");
+    fn lowers_match_block_to_control_flow() {
+        let text = compile("namespace main\nfn main(x: Int32) -> Int32 { match x { 0 => { return 1; }, _ => { return 2; } } }");
+        assert!(text.contains("br label %match_check"));
+        assert!(text.contains("icmp eq i32"));
+        assert!(text.contains("match_merge"));
+    }
+
+    #[test]
+    fn lowers_match_exp_to_control_flow() {
+        let text = compile(
+            "namespace main\nfn main(x: Int32) -> Int32 { return match x { 0 => 1, _ => 2, } }",
+        );
         assert!(text.contains("br label %match_check"));
         assert!(text.contains("icmp eq i32"));
         assert!(text.contains("match_merge"));
