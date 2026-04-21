@@ -547,51 +547,40 @@ void ty_chan_recv(struct SlabArena* arena, TyChan* ch, void* out) {
     chan_park(ch, &ch->recv_q, out, &ch->lock);
 }
 
-int ty_chan_try_recv(struct SlabArena* arena, TyChan* ch, void* out) {
+int ty_chan_try_recv(struct SlabArena* arena, struct TyChan* ch, void* out)
+{
     (void)arena;
-    for (;;) {
-        ty_mutex_lock(&ch->lock);
+    ty_mutex_lock(&ch->lock);
 
-        if (ch->len > 0) {
-            memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
-            ch->head = (ch->head + 1) % ch->cap;
-            ch->len--;
-            if (ch->send_q) {
-                WaitNode* s = ch->send_q; ch->send_q = s->next;
-                memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
-                ch->tail = (ch->tail + 1) % ch->cap;
-                ch->len++;
-                ty_mutex_unlock(&ch->lock);
-                sched_enqueue(s->coro);
-            } else {
-                ty_mutex_unlock(&ch->lock);
-            }
-            return 1;
-        }
-
+    if (ch->len > 0) {
+        memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
+        ch->head = (ch->head + 1) % ch->cap;
+        ch->len--;
         if (ch->send_q) {
-            WaitNode* s = ch->send_q; ch->send_q = s->next;
-            memcpy(out, s->elem, ch->elem_size);
+            WaitNode* s = ch->send_q;
+            ch->send_q = s->next;
+            memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
+            ch->tail = (ch->tail + 1) % ch->cap;
+            ch->len++;
             ty_mutex_unlock(&ch->lock);
             sched_enqueue(s->coro);
-            return 1;
+        } else {
+            ty_mutex_unlock(&ch->lock);
         }
-
-        int closed = ch->closed;
-        size_t elem_size = ch->elem_size;
-        ty_mutex_unlock(&ch->lock);
-
-        // Closed and empty: no more values.
-        if (closed) { memset(out, 0, elem_size); return 0; }
-
-        // Heuristic: if no active coroutines, nothing else will ever send.
-        if (atomic_load_explicit(&active_coros, memory_order_acquire) == 0) {
-            return 0;
-        }
-
-        // Let other worker threads run and try again.
-        ty_sleep_ns(10000); /* 10 us */
+        return 1;
     }
+
+    if (ch->send_q) {
+        WaitNode* s = ch->send_q;
+        ch->send_q = s->next;
+        memcpy(out, s->elem, ch->elem_size);
+        ty_mutex_unlock(&ch->lock);
+        sched_enqueue(s->coro);
+        return 1;
+    }
+
+    ty_mutex_unlock(&ch->lock);
+    return 0;   // ← genuinely empty right now; caller decides what to do
 }
 
 void ty_chan_close(TyChan* ch) {

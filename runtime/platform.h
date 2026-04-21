@@ -68,7 +68,7 @@ static inline int ty_thread_create(TyThread* t, void*(*fn)(void*), void* arg) {
 }
 static inline void ty_thread_join(TyThread t) { pthread_join(t, NULL); }
 
-/* ── mutex ───────────────────────────────────────────────────────────────── */
+/* ── mutex ───────────────────────────────────────────────────────────── */
 typedef pthread_mutex_t TyMutex;
 #define TY_MUTEX_INIT    PTHREAD_MUTEX_INITIALIZER
 static inline void ty_mutex_init(TyMutex* m)    { pthread_mutex_init(m, NULL); }
@@ -239,7 +239,7 @@ static inline void ty_thread_join(TyThread t) {
     CloseHandle(t);
 }
 
-/* ── mutex ───────────────────────────────────────────────────────────────── */
+/* ── mutex ───────────────────────────────────────────────────────────── */
 typedef CRITICAL_SECTION TyMutex;
 /* No static initialiser equivalent on Windows — always call ty_mutex_init. */
 #define TY_MUTEX_INIT {0}

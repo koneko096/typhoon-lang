@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "ty_mem.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,7 +29,6 @@ extern "C" {
 
 typedef struct TyCoro  TyCoro;    /* coroutine (green thread)                */
 typedef struct TyChan  TyChan;    /* typed channel (send / recv)             */
-struct SlabArena;                 /* task-local memory arena                 */
 
 /* ── scheduler lifecycle ─────────────────────────────────────────────────── */
 

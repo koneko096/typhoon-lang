@@ -1640,7 +1640,6 @@ impl<'a> IrBuilder<'a> {
                         return "0".to_string();
                     }
                     "try_recv" => {
-                        // Non-blocking receive: use runtime `ty_chan_try_recv` and wrap as Option.
                         if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
                             if let InferType::App(ref name, ref ty_args) = ty {
                                 if name == "Option" && ty_args.len() == 1 {
@@ -1655,77 +1654,21 @@ impl<'a> IrBuilder<'a> {
                                         "  {} = bitcast {}* {} to i8*",
                                         out_raw, elem_ty, out_slot
                                     ));
-                                    let ok32 = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
-                                        ok32, base_val, out_raw
-                                    ));
-                                    let ok = self.tmp();
-                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok, ok32));
 
-                                    // Give scheduler one chance to run blocked senders before returning None.
-                                    let some1_lbl = self.label("chan_some1");
-                                    let retry_lbl = self.label("chan_retry");
-                                    let some2_lbl = self.label("chan_some2");
-                                    let none_lbl = self.label("chan_none");
-                                    let merge_lbl = self.label("chan_merge");
+                                    // Blocking receive — parks the coroutine until a value arrives
+                                    // or the channel is closed. Always returns Some(value).
                                     self.emit(format!(
-                                        "  br i1 {}, label %{}, label %{}",
-                                        ok, some1_lbl, retry_lbl
+                                        "  call void @ty_chan_recv(i8* %task, i8* {}, i8* {})",
+                                        base_val, out_raw
                                     ));
 
-                                    self.emit(format!("{}:", some1_lbl));
-                                    let loaded1 = self.tmp();
+                                    let loaded = self.tmp();
                                     self.emit(format!(
                                         "  {} = load {}, {}* {}",
-                                        loaded1, elem_ty, elem_ty, out_slot
+                                        loaded, elem_ty, elem_ty, out_slot
                                     ));
-                                    let some1_val =
-                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded1);
-                                    self.emit(format!("  br label %{}", merge_lbl));
-
-                                    self.emit(format!("{}:", retry_lbl));
-                                    self.emit("  call void @ty_yield()".to_string());
-                                    let ok32_2 = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
-                                        ok32_2, base_val, out_raw
-                                    ));
-                                    let ok2 = self.tmp();
-                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok2, ok32_2));
-                                    self.emit(format!(
-                                        "  br i1 {}, label %{}, label %{}",
-                                        ok2, some2_lbl, none_lbl
-                                    ));
-
-                                    self.emit(format!("{}:", some2_lbl));
-                                    let loaded2 = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = load {}, {}* {}",
-                                        loaded2, elem_ty, elem_ty, out_slot
-                                    ));
-                                    let some2_val =
-                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded2);
-                                    self.emit(format!("  br label %{}", merge_lbl));
-
-                                    self.emit(format!("{}:", none_lbl));
-                                    let none_val = self.emit_option_none(&opt_ty, &elem_ty);
-                                    self.emit(format!("  br label %{}", merge_lbl));
-
-                                    self.emit(format!("{}:", merge_lbl));
-                                    let phi = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = phi {} [ {}, %{} ], [ {}, %{} ], [ {}, %{} ]",
-                                        phi,
-                                        opt_ty,
-                                        some1_val,
-                                        some1_lbl,
-                                        some2_val,
-                                        some2_lbl,
-                                        none_val,
-                                        none_lbl
-                                    ));
-                                    return phi;
+                                    let some_val = self.emit_option_some(&opt_ty, &elem_ty, &loaded);
+                                    return some_val;
                                 }
                             }
                         }

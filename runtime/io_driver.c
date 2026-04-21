@@ -39,6 +39,7 @@
 #include "platform.h"
 #include "atomic.h"
 #include "io_driver.h"
+#include "scheduler.h"
 
 /* ── platform includes ───────────────────────────────────────────────────────── */
 
@@ -102,34 +103,34 @@ static void io_result_store(void* coro, int64_t result) {
     /* Table full — should never happen (at most one in-flight op per coro) */
 }
 
-// int64_t ty_io_take_result(void* coro) {
-//     uintptr_t key = (uintptr_t)coro;
-//     uint32_t  idx = (uint32_t)(key >> 4u) & IO_RESULT_MASK;
-//     for (uint32_t i = 0; i < IO_RESULT_CAP; i++) {
-//         uint32_t s = (idx + i) & IO_RESULT_MASK;
-//         if (atomic_load_explicit(&io_result_table[s].key,
-//                                  memory_order_acquire) == key) {
-//             int64_t r = atomic_load_explicit(&io_result_table[s].result,
-//                                              memory_order_acquire);
-//             atomic_store_explicit(&io_result_table[s].key,
-//                                   0u, memory_order_release);
-//             return r;
-//         }
-//     }
-//     return -1; /* not found — shouldn't happen */
-// }
+int64_t ty_io_take_result(void* coro) {
+    uintptr_t key = (uintptr_t)coro;
+    uint32_t  idx = (uint32_t)(key >> 4u) & IO_RESULT_MASK;
+    for (uint32_t i = 0; i < IO_RESULT_CAP; i++) {
+        uint32_t s = (idx + i) & IO_RESULT_MASK;
+        if (atomic_load_explicit(&io_result_table[s].key,
+                                 memory_order_acquire) == key) {
+            int64_t r = atomic_load_explicit(&io_result_table[s].result,
+                                             memory_order_acquire);
+            atomic_store_explicit(&io_result_table[s].key,
+                                  0u, memory_order_release);
+            return r;
+        }
+    }
+    return -1; /* not found — shouldn't happen */
+}
 
 /* ── Park / wake ──────────────────────────────────────────────────────────────── */
 
-// void ty_io_park_coro(void* task) {
-//     (void)task;
-//     ty_coro_block_and_yield();   /* defined in scheduler.c */
-// }
+void ty_io_park_coro(void* task) {
+    (void)task;
+    ty_coro_block_and_yield();   /* defined in scheduler.c */
+}
 
-// void ty_io_wake_coro(void* coro, int64_t result) {
-//     io_result_store(coro, result);
-//     sched_enqueue_from_external(coro); /* defined in scheduler.c */
-// }
+void ty_io_wake_coro(void* coro, int64_t result) {
+    io_result_store(coro, result);
+    sched_enqueue_from_external(coro); /* defined in scheduler.c */
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Pending request pool
@@ -565,6 +566,7 @@ static _Atomic(int)      g_poll_running;
 static TyThread          g_poll_thread;
 
 // void* ty_io_global_driver(void) { return &g_driver; }
+void* ty_io_global_driver(void) { return &g_driver; }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Poll thread
@@ -625,6 +627,42 @@ static void* io_poll_thread(void* arg) {
 //         g_driver.impl = NULL;
 //     }
 // }
+void ty_io_subsystem_init(void) {
+    memset(io_result_table, 0, sizeof(io_result_table));
+    memset(&g_driver, 0, sizeof(g_driver));
+
+#if defined(__linux__)
+    g_driver.impl = uring_new();
+#elif defined(__APPLE__)
+    g_driver.impl = kq_new();
+#elif defined(_WIN32)
+    g_driver.impl = iocp_new();
+#endif
+
+    atomic_init(&g_poll_running, 1);
+
+    if (g_driver.impl) {
+        if (!ty_thread_create(&g_poll_thread, io_poll_thread, NULL)) {
+            /* Non-fatal: poll loop driven inline (degraded to blocking I/O) */
+            atomic_store_explicit(&g_poll_running, 0, memory_order_relaxed);
+        }
+    }
+}
+
+void ty_io_subsystem_shutdown(void) {
+    atomic_store_explicit(&g_poll_running, 0, memory_order_release);
+    if (g_driver.impl) {
+        ty_thread_join(g_poll_thread);
+#if defined(__linux__)
+        uring_destroy(g_driver.impl);
+#elif defined(__APPLE__)
+        kq_destroy(g_driver.impl);
+#elif defined(_WIN32)
+        iocp_destroy(g_driver.impl);
+#endif
+        g_driver.impl = NULL;
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Public file open / close
@@ -740,14 +778,14 @@ static void do_submit_or_sync(void* driver_ptr, void* task, void* coro,
     (void)task;
 }
 
-// int64_t ty_io_read(void* driver, void* task, void* coro,
-//                    int fd, uint8_t* buf, size_t len) {
-//     do_submit_or_sync(driver, task, coro, fd, buf, len, 0);
-//     return 0; /* actual value via ty_io_take_result(coro) in ty_io.c */
-// }
+int64_t ty_io_read(void* driver, void* task, void* coro,
+                   int fd, uint8_t* buf, size_t len) {
+    do_submit_or_sync(driver, task, coro, fd, buf, len, 0);
+    return 0; /* actual value via ty_io_take_result(coro) in ty_io.c */
+}
 
-// int64_t ty_io_write(void* driver, void* task, void* coro,
-//                     int fd, const uint8_t* buf, size_t len) {
-//     do_submit_or_sync(driver, task, coro, fd, (uint8_t*)buf, len, 1);
-//     return 0;
-// }
+int64_t ty_io_write(void* driver, void* task, void* coro,
+                    int fd, const uint8_t* buf, size_t len) {
+    do_submit_or_sync(driver, task, coro, fd, (uint8_t*)buf, len, 1);
+    return 0;
+}
