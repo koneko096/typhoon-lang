@@ -22,24 +22,32 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 #include "platform.h"
 #include "ty_mem.h"
 
-/* ── configuration ──────────────────────────────────────────────────────────── */
+#ifndef _MSC_VER
+#include <unistd.h>
+#endif
 
-#define ARENA_PAGE_SIZE  (4 * 1024 * 1024)   /* 4 MiB per bump page             */
-#define NUM_SIZE_CLASSES  8
-#define LARGE_THRESHOLD   1024               /* bytes; above → oversized         */
+/* ── configuration ────────────────────────────────────────────────────────────
+ */
+
+#define ARENA_PAGE_SIZE  (4 * 1024 * 1024) /* 4 MiB per bump page */
+#define NUM_SIZE_CLASSES 8
+#define LARGE_THRESHOLD  1024              /* bytes; above → oversized         */
 
 static const int32_t SIZE_CLASS_BYTES[NUM_SIZE_CLASSES] = {
     8, 16, 32, 64, 128, 256, 512, 1024
 };
 
-/* ── hard abort ─────────────────────────────────────────────────────────────── */
+/* ── hard abort ───────────────────────────────────────────────────────────────
+ */
 
 static void ty_abort(void) { TY_TRAP(); }
 
-/* ── helpers ────────────────────────────────────────────────────────────────── */
+/* ── helpers ──────────────────────────────────────────────────────────────────
+ */
 
 static inline uint8_t* align_up(uint8_t* ptr, size_t align) {
     uintptr_t p = (uintptr_t)ptr;
@@ -53,7 +61,8 @@ static inline int32_t size_to_class(size_t size) {
     return NUM_SIZE_CLASSES; /* oversized */
 }
 
-/* ── virtual memory ─────────────────────────────────────────────────────────── */
+/* ── virtual memory ───────────────────────────────────────────────────────────
+ */
 
 static void* vm_reserve(size_t size) {
 #ifdef _WIN32
@@ -62,7 +71,7 @@ static void* vm_reserve(size_t size) {
     return p;
 #else
     void* p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) ty_abort();
     return p;
 #endif
@@ -77,7 +86,8 @@ static void vm_release(void* ptr, size_t size) {
 #endif
 }
 
-/* ── bump page ──────────────────────────────────────────────────────────────── */
+/* ── bump page ────────────────────────────────────────────────────────────────
+ */
 
 typedef struct BumpPage {
     struct BumpPage* next;
@@ -87,28 +97,31 @@ typedef struct BumpPage {
 } BumpPage;
 
 static BumpPage* bump_page_new(size_t capacity) {
-    size_t    total = sizeof(BumpPage) + capacity;
-    BumpPage* pg    = (BumpPage*)vm_reserve(total);
-    pg->next        = NULL;
-    pg->bump_ptr    = (uint8_t*)(pg + 1);
-    pg->end         = pg->bump_ptr + capacity;
+    size_t total = sizeof(BumpPage) + capacity;
+    BumpPage* pg = (BumpPage*)vm_reserve(total);
+    pg->next     = NULL;
+    pg->bump_ptr = (uint8_t*)(pg + 1);
+    pg->end      = pg->bump_ptr + capacity;
     return pg;
 }
 
-/* ── oversized block header ─────────────────────────────────────────────────── */
+/* ── oversized block header ───────────────────────────────────────────────────
+ */
 
 typedef struct OversizedHdr {
     struct OversizedHdr* next;
     size_t               total_size;
 } OversizedHdr;
 
-/* ── free-list node ─────────────────────────────────────────────────────────── */
+/* ── free-list node ───────────────────────────────────────────────────────────
+ */
 
 typedef struct FreeNode {
     struct FreeNode* next;
 } FreeNode;
 
-/* ── arena ──────────────────────────────────────────────────────────────────── */
+/* ── arena ────────────────────────────────────────────────────────────────────
+ */
 
 typedef struct SlabArena {
     BumpPage*     current_page;
@@ -116,14 +129,16 @@ typedef struct SlabArena {
     FreeNode*     free_lists[NUM_SIZE_CLASSES];
 } SlabArena;
 
-/* ── forward declarations ───────────────────────────────────────────────────── */
+/* ── forward declarations ─────────────────────────────────────────────────────
+ */
 
 static void* arena_alloc(SlabArena* arena, size_t size, size_t align);
-static void  arena_free_slot(SlabArena* arena, void* ptr, size_t size);
+static void arena_free_slot(SlabArena* arena, void* ptr, size_t size);
 static void* arena_realloc(SlabArena* arena, void* ptr,
-                            size_t old_size, size_t new_size, size_t align);
+                           size_t old_size, size_t new_size, size_t align);
 
-/* ── arena lifecycle ────────────────────────────────────────────────────────── */
+/* ── arena lifecycle ──────────────────────────────────────────────────────────
+ */
 
 /*
  * slab_arena_new — called once by main(); the returned pointer is the
@@ -134,14 +149,14 @@ static void* arena_realloc(SlabArena* arena, void* ptr,
  * so no allocation outside the arena is ever needed.
  */
 SlabArena* slab_arena_new(void) {
-    size_t    cap = ARENA_PAGE_SIZE - sizeof(BumpPage);
-    BumpPage* pg  = bump_page_new(cap);
-
-    SlabArena* arena = (SlabArena*)pg->bump_ptr;
-    pg->bump_ptr    += sizeof(SlabArena);
+    size_t cap = ARENA_PAGE_SIZE - sizeof(BumpPage);
+    BumpPage* pg = bump_page_new(cap);
+    uint8_t* ptr = align_up(pg->bump_ptr, 16);
+    SlabArena* arena = (SlabArena*)ptr;
+    pg->bump_ptr = ptr + sizeof(SlabArena);
 
     arena->current_page = pg;
-    arena->oversized    = NULL;
+    arena->oversized = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         arena->free_lists[i] = NULL;
     return arena;
@@ -167,17 +182,18 @@ void slab_arena_free(SlabArena* arena) {
     BumpPage* pg = arena->current_page;
     while (pg) {
         BumpPage* prev = pg->next;
-        size_t    sz   = (size_t)(pg->end - (uint8_t*)pg);
+        size_t sz = (size_t)(pg->end - (uint8_t*)pg);
         vm_release(pg, sz);
         pg = prev;
     }
 }
 
-/* ── internal allocator ─────────────────────────────────────────────────────── */
+/* ── internal allocator ───────────────────────────────────────────────────────
+ */
 
 static void* arena_bump_raw(SlabArena* arena, size_t size, size_t align) {
-    BumpPage* pg      = arena->current_page;
-    uint8_t*  aligned = align_up(pg->bump_ptr, align);
+    BumpPage* pg = arena->current_page;
+    uint8_t* aligned = align_up(pg->bump_ptr, align);
 
     if (aligned + size <= pg->end) {
         pg->bump_ptr = aligned + size;
@@ -188,88 +204,102 @@ static void* arena_bump_raw(SlabArena* arena, size_t size, size_t align) {
     size_t new_cap = ARENA_PAGE_SIZE - sizeof(BumpPage);
     if (size + align > new_cap) new_cap = size + align;
 
-    BumpPage* np        = bump_page_new(new_cap);
-    np->next            = arena->current_page;
+    BumpPage* np = bump_page_new(new_cap);
+    np->next = arena->current_page;
     arena->current_page = np;
 
-    aligned       = align_up(np->bump_ptr, align);
-    np->bump_ptr  = aligned + size;
+    aligned = align_up(np->bump_ptr, align);
+    np->bump_ptr = aligned + size;
     return aligned;
 }
 
 static void* arena_alloc(SlabArena* arena, size_t size, size_t align) {
     if (!arena) ty_abort();
-    if (size  == 0) size  = 1;
+    if (size == 0) size = 1;
     if (align == 0) align = 1;
 
+    void* ptr = NULL;
     int32_t cls = size_to_class(size);
 
     if (cls < NUM_SIZE_CLASSES) {
         FreeNode* head = arena->free_lists[cls];
         if (head) {
             arena->free_lists[cls] = head->next;
-            return (void*)head;
+            ptr = (void*)head;
+        } else {
+            size_t slot = (size_t)SIZE_CLASS_BYTES[cls];
+            size_t al = align < 8 ? 8 : align;
+            ptr = arena_bump_raw(arena, slot, al);
         }
-        size_t slot = (size_t)SIZE_CLASS_BYTES[cls];
-        size_t al   = align < 8 ? 8 : align;
-        return arena_bump_raw(arena, slot, al);
+        if (ptr)
+            memset(ptr, 0, (cls < NUM_SIZE_CLASSES) ? (size_t)SIZE_CLASS_BYTES[cls] : size);
+    } else {
+        /* oversized: dedicated mmap page */
+        size_t total = sizeof(OversizedHdr) + size;
+        size_t pgsz = (total + 4095) & ~(size_t)4095;
+        OversizedHdr* hdr = (OversizedHdr*)vm_reserve(pgsz);
+        hdr->total_size = pgsz;
+        hdr->next = arena->oversized;
+        arena->oversized = hdr;
+        ptr = (void*)(hdr + 1);
     }
 
-    /* oversized: dedicated mmap page */
-    size_t total  = sizeof(OversizedHdr) + size;
-    size_t pgsz   = (total + 4095) & ~(size_t)4095;
-    OversizedHdr* hdr = (OversizedHdr*)vm_reserve(pgsz);
-    hdr->total_size   = pgsz;
-    hdr->next         = arena->oversized;
-    arena->oversized  = hdr;
-    return (void*)(hdr + 1);
+    return ptr;
 }
 
 static void arena_free_slot(SlabArena* arena, void* ptr, size_t size) {
     if (!arena || !ptr) return;
     int32_t cls = size_to_class(size);
     if (cls >= NUM_SIZE_CLASSES) return; /* oversized — released at arena_free */
-    FreeNode* node         = (FreeNode*)ptr;
-    node->next             = arena->free_lists[cls];
+    FreeNode* node = (FreeNode*)ptr;
+    node->next = arena->free_lists[cls];
     arena->free_lists[cls] = node;
 }
 
-static void* arena_realloc(SlabArena* arena, void* ptr,
-                            size_t old_size, size_t new_size, size_t align) {
-    if (!ptr)      return arena_alloc(arena, new_size, align);
-    if (!new_size) { arena_free_slot(arena, ptr, old_size); return NULL; }
+static void* arena_realloc(SlabArena* arena, void* ptr, size_t old_size,
+    size_t new_size, size_t align) {
+    if (!ptr) return arena_alloc(arena, new_size, align);
+    if (!new_size) {
+        arena_free_slot(arena, ptr, old_size);
+        return NULL;
+    }
 
-    void*  fresh = arena_alloc(arena, new_size, align);
-    size_t copy  = old_size < new_size ? old_size : new_size;
+    void* fresh = arena_alloc(arena, new_size, align);
+    size_t copy = old_size < new_size ? old_size : new_size;
     memcpy(fresh, ptr, copy);
     arena_free_slot(arena, ptr, old_size);
     return fresh;
 }
 
-/* ── public slab API (called from emitted LLVM IR) ──────────────────────────── */
+/* ── public slab API (called from emitted LLVM IR) ────────────────────────────
+ */
 
 void* slab_alloc(SlabArena* arena, int32_t size_class) {
     if (!arena) ty_abort();
-    if (size_class < 0 || size_class >= NUM_SIZE_CLASSES)
-        return arena_alloc(arena, (size_t)LARGE_THRESHOLD * 2, 8);
+    if (size_class < 0 || size_class >= NUM_SIZE_CLASSES) return arena_alloc(arena, (size_t)LARGE_THRESHOLD * 2, 8);
 
     FreeNode* head = arena->free_lists[size_class];
     if (head) {
         arena->free_lists[size_class] = head->next;
+        memset(head, 0, (size_t)SIZE_CLASS_BYTES[size_class]);
         return (void*)head;
     }
-    return arena_bump_raw(arena, (size_t)SIZE_CLASS_BYTES[size_class], 8);
+    void* p = arena_bump_raw(arena, (size_t)SIZE_CLASS_BYTES[size_class], 16);
+    if (p)
+        memset(p, 0, (size_t)SIZE_CLASS_BYTES[size_class]);
+    return p;
 }
 
 void slab_free(SlabArena* arena, void* ptr, int32_t size_class) {
     if (!arena || !ptr) return;
     if (size_class < 0 || size_class >= NUM_SIZE_CLASSES) return;
-    FreeNode* node         = (FreeNode*)ptr;
-    node->next             = arena->free_lists[size_class];
+    FreeNode* node = (FreeNode*)ptr;
+    node->next = arena->free_lists[size_class];
     arena->free_lists[size_class] = node;
 }
 
-/* ── Buf ─────────────────────────────────────────────────────────────────────── */
+/* ── Buf
+ * ─────────────────────────────────────────────────────────────────────── */
 
 static void ty_buf_grow(SlabArena* arena, Buf* b, int64_t extra) {
     if (!b) return;
@@ -279,18 +309,14 @@ static void ty_buf_grow(SlabArena* arena, Buf* b, int64_t extra) {
     int64_t new_cap = b->cap ? b->cap : 64;
     while (new_cap < need) new_cap *= 2;
 
-    b->data = (char*)arena_realloc(arena,
-                                   b->data,
-                                   (size_t)b->cap,
-                                   (size_t)new_cap,
-                                   1);
+    b->data = (char*)arena_realloc(arena, b->data, (size_t)b->cap, (size_t)new_cap, 1);
     b->cap = new_cap;
 }
 
 Buf* ty_buf_new(SlabArena* arena) {
-    Buf* b  = (Buf*)arena_alloc(arena, sizeof(Buf), 8);
-    b->len  = 0;
-    b->cap  = 64;
+    Buf* b = (Buf*)arena_alloc(arena, sizeof(Buf), 8);
+    b->len = 0;
+    b->cap = 64;
     b->data = (char*)arena_alloc(arena, 64, 1);
     b->data[0] = '\0';
     return b;
@@ -316,31 +342,35 @@ char* ty_buf_into_str(SlabArena* arena, Buf* b) {
     return out;
 }
 
-/* ── TyArray ─────────────────────────────────────────────────────────────────── */
+/* ── TyArray
+ * ─────────────────────────────────────────────────────────────────── */
 
-TyArray* ty_array_from_fixed(SlabArena* arena, void* data,
-                              int64_t len, int64_t elem_size, int64_t elem_align) {
-    if (len < 0)        ty_abort();
+TyArray* ty_array_from_fixed(SlabArena* arena, void* data, int64_t len,
+    int64_t elem_size, int64_t elem_align) {
+    if (len < 0) ty_abort();
     if (elem_size <= 0) ty_abort();
 
-    TyArray* arr    = (TyArray*)arena_alloc(arena, sizeof(TyArray), 8);
-    arr->len        = len;
-    arr->cap        = len;
-    arr->elem_size  = elem_size;
+    TyArray* arr = (TyArray*)arena_alloc(arena, sizeof(TyArray), 8);
+    arr->len = len;
+    arr->cap = len;
+    arr->elem_size = elem_size;
     arr->elem_align = elem_align;
 
-    if (len == 0) { arr->data = NULL; return arr; }
+    if (len == 0) {
+        arr->data = NULL;
+        return arr;
+    }
 
     size_t bytes = (size_t)(len * elem_size);
-    arr->data    = arena_alloc(arena, bytes, (size_t)elem_align);
+    arr->data = arena_alloc(arena, bytes, (size_t)elem_align);
     memcpy(arr->data, data, bytes);
     return arr;
 }
 
 void* ty_array_get_ptr(TyArray* arr, int64_t idx) {
-    if (!arr)                       return NULL;
+    if (!arr) return NULL;
     if (idx < 0 || idx >= arr->len) return NULL;
-    if (!arr->data)                 return NULL;
+    if (!arr->data) return NULL;
     return (void*)((uint8_t*)arr->data + (size_t)(idx * arr->elem_size));
 }
 
@@ -348,19 +378,16 @@ void ty_array_push(SlabArena* arena, TyArray* arr, void* elem_bytes) {
     if (!arr || arr->elem_size <= 0) ty_abort();
 
     if (arr->len == arr->cap) {
-        int64_t new_cap   = arr->cap ? arr->cap * 2 : 8;
-        size_t  old_bytes = (size_t)(arr->cap * arr->elem_size);
-        size_t  new_bytes = (size_t)(new_cap  * arr->elem_size);
+        int64_t new_cap = arr->cap ? arr->cap * 2 : 8;
+        size_t old_bytes = (size_t)(arr->cap * arr->elem_size);
+        size_t new_bytes = (size_t)(new_cap * arr->elem_size);
 
-        arr->data = arena_realloc(arena,
-                                  arr->data,
-                                  old_bytes,
-                                  new_bytes,
-                                  (size_t)arr->elem_align);
+        arr->data = arena_realloc(arena, arr->data, old_bytes, new_bytes,
+            (size_t)arr->elem_align);
         arr->cap = new_cap;
     }
 
-    memcpy((uint8_t*)arr->data + (size_t)(arr->len * arr->elem_size),
-           elem_bytes, (size_t)arr->elem_size);
+    memcpy((uint8_t*)arr->data + (size_t)(arr->len * arr->elem_size), elem_bytes,
+        (size_t)arr->elem_size);
     arr->len++;
 }

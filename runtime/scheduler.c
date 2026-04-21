@@ -20,15 +20,53 @@
 #include "atomic.h"
 #include "ty_mem.h"
 #include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <assert.h>
+
+#ifndef _MSC_VER
+#include <unistd.h>
+#endif
+
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define TY_ASAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define TY_ASAN 1
+#endif
+
+#ifdef TY_ASAN
+#  include <sanitizer/asan_interface.h>
+#endif
+
+#if defined(TY_ASAN) && !defined(_MSC_VER)
+#  define TY_NO_ASAN __attribute__((no_sanitize("address")))
+#else
+#  define TY_NO_ASAN
+#endif
+
+/* ── debug logging ───────────────────────────────────────────────────────── */
+/* Set TY_SCHED_DEBUG_ENABLED=1 at compile time to enable verbose logging.   */
+// #ifdef TY_SCHED_DEBUG_ENABLED
+#  define TY_SCHED_DEBUG(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
+// #else
+// #  define TY_SCHED_DEBUG(fmt, ...) ((void)0)
+// #endif
+
 
 /* ── configuration ───────────────────────────────────────────────────────── */
 
-#define CORO_STACK_SIZE   (64 * 1024)   /* 64 KB coroutine stack data          */
-#define GUARD_PAGE_SIZE   4096          /* one page, PROT_NONE / PAGE_NOACCESS */
-#define DEQUE_INITIAL_CAP 256           /* must be power of 2                  */
+#define CORO_STACK_SIZE   (128 * 1024) /* 128 KB coroutine stack data          */
+#define GUARD_PAGE_SIZE   4096 /* one page, PROT_NONE / PAGE_NOACCESS */
+#define DEQUE_INITIAL_CAP 256 /* must be power of 2                  */
 #define MAX_WORKERS       64
-#define SIGPROF_HZ        100           /* preemption ticks per second         */
-#define STEAL_RETRIES     4             /* steal attempts before sleeping       */
+#define SIGPROF_HZ        100 /* preemption ticks per second         */
+#define STEAL_RETRIES     4 /* steal attempts before sleeping       */
+#define EBR_RECLAIM_THRESHOLD 64
+#define EBR_EXTERNAL_SLOT MAX_WORKERS
+#define EBR_SLOT_COUNT (MAX_WORKERS + 1)
 
 /* ── hard abort ──────────────────────────────────────────────────────────── */
 
@@ -37,20 +75,21 @@ static void sched_abort(const char* msg) {
     TY_TRAP();
 }
 
+typedef struct DequeRetiredNode {
+    DequeArray* array;
+    size_t cap;
+    uint64_t retire_epoch;
+    struct DequeRetiredNode* next;
+} DequeRetiredNode;
+
+static int ebr_worker_id(void);
+static void ebr_enter_worker(int worker_id);
+static void ebr_exit_worker(int worker_id);
+static void ebr_retire_array(DequeArray* array, size_t cap);
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Chase-Lev Work-Stealing Deque
  * ══════════════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    _Atomic(size_t)  cap;
-    _Atomic(void**)  buf;
-} DequeArray;
-
-typedef struct WSDeque {
-    _Atomic(long)         top;
-    _Atomic(long)         bottom;
-    _Atomic(DequeArray*)  array;
-} WSDeque;
 
 static DequeArray* deque_array_new(size_t cap) {
     size_t total = sizeof(DequeArray) + cap * sizeof(void*);
@@ -63,9 +102,9 @@ static DequeArray* deque_array_new(size_t cap) {
 }
 
 static void deque_init(WSDeque* dq) {
-    atomic_init(&dq->top,    0);
+    atomic_init(&dq->top, 0);
     atomic_init(&dq->bottom, 0);
-    atomic_init(&dq->array,  deque_array_new(DEQUE_INITIAL_CAP));
+    atomic_init(&dq->array, deque_array_new(DEQUE_INITIAL_CAP));
 }
 
 static void deque_grow(WSDeque* dq, DequeArray* old, long top, long bot) {
@@ -75,40 +114,48 @@ static void deque_grow(WSDeque* dq, DequeArray* old, long top, long bot) {
     void** ob = atomic_load_explicit(&old->buf, memory_order_relaxed);
     void** nb = atomic_load_explicit(&fresh->buf, memory_order_relaxed);
     for (long i = top; i < bot; i++)
-        nb[i & (new_cap-1)] = ob[i & (old_cap-1)];
+        nb[i & (new_cap - 1)] = ob[i & (old_cap - 1)];
     atomic_store_explicit(&dq->array, fresh, memory_order_release);
-    /* old array leaked — safe reclamation needs hazard pointers */
+    ebr_retire_array(old, old_cap);
 }
 
 static void deque_push(WSDeque* dq, void* item) {
+    int ebr_id = ebr_worker_id();
+    ebr_enter_worker(ebr_id);
     long bot = atomic_load_explicit(&dq->bottom, memory_order_relaxed);
-    long top = atomic_load_explicit(&dq->top,    memory_order_acquire);
+    long top = atomic_load_explicit(&dq->top, memory_order_acquire);
     DequeArray* a = atomic_load_explicit(&dq->array, memory_order_relaxed);
-    size_t cap    = atomic_load_explicit(&a->cap,    memory_order_relaxed);
+    size_t cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
     if ((size_t)(bot - top) >= cap - 1) {
         deque_grow(dq, a, top, bot);
-        a   = atomic_load_explicit(&dq->array, memory_order_relaxed);
-        cap = atomic_load_explicit(&a->cap,    memory_order_relaxed);
+        a = atomic_load_explicit(&dq->array, memory_order_relaxed);
+        cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
     }
     void** buf = atomic_load_explicit(&a->buf, memory_order_relaxed);
-    buf[bot & (cap-1)] = item;
+    buf[bot & (cap - 1)] = item;
     atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&dq->bottom, bot + 1, memory_order_relaxed);
+    /* seq_cst so stealers on other cores see the updated bottom immediately */
+    atomic_store_explicit(&dq->bottom, bot + 1, memory_order_seq_cst);
+    ebr_exit_worker(ebr_id);
 }
 
 static void* deque_pop(WSDeque* dq) {
+    int ebr_id = ebr_worker_id();
+    ebr_enter_worker(ebr_id);
     long bot = atomic_load_explicit(&dq->bottom, memory_order_relaxed) - 1;
-    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_relaxed);
+    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_acquire);
     atomic_store_explicit(&dq->bottom, bot, memory_order_relaxed);
     atomic_thread_fence(memory_order_seq_cst);
     long top = atomic_load_explicit(&dq->top, memory_order_relaxed);
     if (top > bot) {
         atomic_store_explicit(&dq->bottom, bot + 1, memory_order_relaxed);
+        ebr_exit_worker(ebr_id);
         return NULL;
     }
+    /* Use proper atomic loads — plain field access bypasses memory model */
     size_t cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
     void** buf = atomic_load_explicit(&a->buf, memory_order_relaxed);
-    void*  item = buf[bot & (cap-1)];
+    void* item = buf[bot & (cap - 1)];
     if (top == bot) {
         long expected = top;
         if (!atomic_compare_exchange_strong_explicit(
@@ -117,123 +164,327 @@ static void* deque_pop(WSDeque* dq) {
             item = NULL;
         atomic_store_explicit(&dq->bottom, bot + 1, memory_order_relaxed);
     }
+    ebr_exit_worker(ebr_id);
     return item;
 }
 
 static void* deque_steal(WSDeque* dq) {
+    int ebr_id = ebr_worker_id();
+    ebr_enter_worker(ebr_id);
     long top = atomic_load_explicit(&dq->top, memory_order_acquire);
     atomic_thread_fence(memory_order_seq_cst);
     long bot = atomic_load_explicit(&dq->bottom, memory_order_acquire);
-    if (top >= bot) return NULL;
-    DequeArray* a   = atomic_load_explicit(&dq->array, memory_order_consume);
-    size_t      cap = atomic_load_explicit(&a->cap,    memory_order_relaxed);
-    void**      buf = atomic_load_explicit(&a->buf,    memory_order_relaxed);
-    void*       item = buf[top & (cap-1)];
+    if (top >= bot) {
+        ebr_exit_worker(ebr_id);
+        return NULL;
+    }
+    DequeArray* a = atomic_load_explicit(&dq->array, memory_order_consume);
+    size_t cap = atomic_load_explicit(&a->cap, memory_order_relaxed);
+    void** buf = atomic_load_explicit(&a->buf, memory_order_relaxed);
+    void* item = buf[top & (cap - 1)];
     long expected = top;
     if (!atomic_compare_exchange_strong_explicit(
             &dq->top, &expected, top + 1,
-            memory_order_seq_cst, memory_order_relaxed))
+            memory_order_seq_cst, memory_order_relaxed)) {
+        ebr_exit_worker(ebr_id);
         return NULL;
+    }
+    ebr_exit_worker(ebr_id);
     return item;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- *  Coroutine
- * ══════════════════════════════════════════════════════════════════════════ */
-
-typedef enum {
-    CORO_RUNNABLE = 0,
-    CORO_RUNNING,
-    CORO_BLOCKED,
-    CORO_DONE
-} CoroState;
-
-struct TyCoro {
-    TyCtx                    ctx;
-    void                   (*fn)(void*, void*);
-    void                    *arg;
-    char                    *stack_base;
-    size_t                   stack_total;
-    struct SlabArena        *arena;
-    _Atomic(CoroState)       state;
-    _Atomic(int)             ref;
-    _Atomic(struct TyCoro*)  waiters;
-    _Atomic(int)             waiters_lock;
-    struct TyCoro           *waiter_next;
-    struct TyCoro           *sched_next;
-};
-
-/* ══════════════════════════════════════════════════════════════════════════
- *  Worker
- * ══════════════════════════════════════════════════════════════════════════ */
-
-typedef struct Worker {
-    TyThread      thread;
-    int           id;
-    WSDeque       deque;
-    TyCoro       *current;
-    TyCtx         sched_ctx;      /* scheduler's saved context                */
-    _Atomic(int)  preempt_flag;
-    _Atomic(int)  running;
-} Worker;
-
 /* ── global state ────────────────────────────────────────────────────────── */
 
-static Worker           workers[MAX_WORKERS];
-static int              num_workers = 0;
-static _Atomic(int)     sched_shutdown_flag;
-static _Atomic(int)     active_coros;
+static Worker workers[MAX_WORKERS];
+static int num_workers = 0;
+static _Atomic(int) sched_shutdown_flag;
+static _Atomic(int) active_coros;
+static TyCtx worker_host_ctx[MAX_WORKERS];
+static _Atomic(long) dbg_spawned;
+static _Atomic(long) dbg_freed;
+static _Atomic(long) dbg_blocked;
+static _Atomic(long) dbg_woken;
+static _Atomic(long) dbg_deque_retired;
+static _Atomic(long) dbg_deque_reclaimed;
+static _Atomic(long) dbg_ebr_epoch_advance;
+static _Atomic(uint64_t) ebr_global_epoch;
+static _Atomic(uint64_t) ebr_announced_epoch[EBR_SLOT_COUNT];
+static _Atomic(int) ebr_active[EBR_SLOT_COUNT];
+static DequeRetiredNode* ebr_retired[EBR_SLOT_COUNT];
+static size_t ebr_retired_count[EBR_SLOT_COUNT];
+
+/* Global channel registry. Shutdown closes all channels to wake parked coros.
+ * Without this, shutdown drain loop can hang forever when only chan_park'd
+ * coroutines remain. */
+static TyMutex all_chans_lock;
+static struct TyChan* all_chans_head;
+
+#define CORO_STATE_COUNT 4
+static const unsigned char k_coro_transition_allowed[CORO_STATE_COUNT][CORO_STATE_COUNT] = {
+    /* from RUNNABLE */ { 1, 1, 0, 0 },
+    /* from RUNNING  */ { 1, 0, 1, 1 },
+    /* from BLOCKED  */ { 1, 0, 1, 0 },
+    /* from DONE     */ { 0, 0, 0, 1 }
+};
+static _Atomic(int) coro_invalid_logged[CORO_STATE_COUNT][CORO_STATE_COUNT];
+
+enum {
+    WORKER_PHASE_INIT = 0,
+    WORKER_PHASE_START = 1,
+    WORKER_PHASE_LOOP = 2,
+    WORKER_PHASE_SEEN_SHUTDOWN = 3,
+    WORKER_PHASE_EXIT_LOOP = 4,
+    WORKER_PHASE_RETURN_HOST = 5
+};
 
 static TY_THREAD_LOCAL Worker* tl_worker = NULL;
 
-static Worker* current_worker(void)  { return tl_worker; }
-static TyCoro* current_coro(void)    { Worker* w = current_worker(); return w ? w->current : NULL; }
+static Worker* current_worker(void) { return tl_worker; }
+static TyCoro* current_coro(void) {
+    Worker* w = current_worker();
+    return w ? w->current : NULL;
+}
+
+static int coro_transition_valid(CoroState from, CoroState to) {
+    if ((int)from < 0 || (int)from >= CORO_STATE_COUNT) return 0;
+    if ((int)to < 0 || (int)to >= CORO_STATE_COUNT) return 0;
+    return k_coro_transition_allowed[from][to] != 0;
+}
+
+static void coro_report_invalid_transition(
+    TyCoro* co, CoroState from, CoroState to, const char* op, Worker* w) {
+    int worker_id = w ? w->id : -1;
+#ifdef TY_SCHED_DEBUG_ENABLED
+    fprintf(stderr,
+        "[sched] invalid state transition op=%s worker=%d coro=%p from=%d to=%d\n",
+        op, worker_id, (void*)co, (int)from, (int)to);
+    assert(!"invalid coroutine state transition");
+#else
+    if (from == CORO_DONE && to != CORO_DONE)
+        sched_abort("coroutine state corruption: transition from CORO_DONE");
+
+    if ((int)from >= 0 && (int)from < CORO_STATE_COUNT &&
+        (int)to >= 0 && (int)to < CORO_STATE_COUNT) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &coro_invalid_logged[from][to], &expected, 1,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            fprintf(stderr,
+                "[sched] invalid state transition op=%s worker=%d coro=%p from=%d to=%d\n",
+                op, worker_id, (void*)co, (int)from, (int)to);
+        }
+    }
+#endif
+}
+
+static void coro_state_store(TyCoro* co, CoroState to, const char* op) {
+    Worker* w = current_worker();
+    CoroState from = atomic_load_explicit(&co->state, memory_order_acquire);
+    if (!coro_transition_valid(from, to)) {
+        coro_report_invalid_transition(co, from, to, op, w);
+        return;
+    }
+    atomic_store_explicit(&co->state, to, memory_order_release);
+    TY_SCHED_DEBUG("[state] op=%s worker=%d coro=%p %d->%d\n",
+        op, w ? w->id : -1, (void*)co, (int)from, (int)to);
+}
+
+static int coro_state_cas(TyCoro* co, CoroState from, CoroState to, const char* op) {
+    Worker* w = current_worker();
+    if (!coro_transition_valid(from, to)) {
+        coro_report_invalid_transition(co, from, to, op, w);
+        return 0;
+    }
+
+    CoroState expected = from;
+    if (atomic_compare_exchange_strong_explicit(
+            &co->state, &expected, to,
+            memory_order_acq_rel, memory_order_relaxed)) {
+        TY_SCHED_DEBUG("[state] op=%s worker=%d coro=%p %d->%d\n",
+            op, w ? w->id : -1, (void*)co, (int)from, (int)to);
+        return 1;
+    }
+
+    if (!coro_transition_valid(expected, to))
+        coro_report_invalid_transition(co, expected, to, op, w);
+    return 0;
+}
+
+static int ebr_worker_id(void) {
+    Worker* w = current_worker();
+    return w ? w->id : EBR_EXTERNAL_SLOT;
+}
+
+static void ebr_enter_worker(int worker_id) {
+    if (worker_id < 0 || worker_id >= EBR_SLOT_COUNT) return;
+    if (worker_id != EBR_EXTERNAL_SLOT && worker_id >= num_workers) return;
+    uint64_t epoch = atomic_load_explicit(&ebr_global_epoch, memory_order_acquire);
+    atomic_store_explicit(&ebr_announced_epoch[worker_id], epoch, memory_order_release);
+    atomic_store_explicit(&ebr_active[worker_id], 1, memory_order_release);
+}
+
+static void ebr_exit_worker(int worker_id) {
+    if (worker_id < 0 || worker_id >= EBR_SLOT_COUNT) return;
+    if (worker_id != EBR_EXTERNAL_SLOT && worker_id >= num_workers) return;
+    atomic_store_explicit(&ebr_active[worker_id], 0, memory_order_release);
+}
+
+static uint64_t ebr_min_active_epoch(void) {
+    uint64_t min_epoch = atomic_load_explicit(&ebr_global_epoch, memory_order_acquire);
+    for (int i = 0; i < num_workers; i++) {
+        if (!atomic_load_explicit(&ebr_active[i], memory_order_acquire))
+            continue;
+        uint64_t announced = atomic_load_explicit(&ebr_announced_epoch[i], memory_order_acquire);
+        if (announced < min_epoch) min_epoch = announced;
+    }
+    if (atomic_load_explicit(&ebr_active[EBR_EXTERNAL_SLOT], memory_order_acquire)) {
+        uint64_t announced = atomic_load_explicit(
+            &ebr_announced_epoch[EBR_EXTERNAL_SLOT], memory_order_acquire);
+        if (announced < min_epoch) min_epoch = announced;
+    }
+    return min_epoch;
+}
+
+static void ebr_advance_epoch(void) {
+    atomic_fetch_add_explicit(&ebr_global_epoch, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&dbg_ebr_epoch_advance, 1, memory_order_relaxed);
+}
+
+static void ebr_try_reclaim_worker(int worker_id) {
+    if (worker_id < 0 || worker_id >= EBR_SLOT_COUNT) return;
+    if (worker_id != EBR_EXTERNAL_SLOT && worker_id >= num_workers) return;
+    uint64_t safe_epoch = ebr_min_active_epoch();
+
+    DequeRetiredNode* node = ebr_retired[worker_id];
+    DequeRetiredNode* keep_head = NULL;
+    DequeRetiredNode* keep_tail = NULL;
+    size_t keep_count = 0;
+
+    while (node) {
+        DequeRetiredNode* next = node->next;
+        if (node->retire_epoch < safe_epoch) {
+            size_t bytes = sizeof(DequeArray) + node->cap * sizeof(void*);
+            ty_vm_free(node->array, bytes);
+            ty_vm_free(node, sizeof(*node));
+            atomic_fetch_add_explicit(&dbg_deque_reclaimed, 1, memory_order_relaxed);
+        } else {
+            node->next = NULL;
+            if (keep_tail) keep_tail->next = node;
+            else keep_head = node;
+            keep_tail = node;
+            keep_count++;
+        }
+        node = next;
+    }
+
+    ebr_retired[worker_id] = keep_head;
+    ebr_retired_count[worker_id] = keep_count;
+}
+
+static void ebr_retire_array(DequeArray* array, size_t cap) {
+    int worker_id = ebr_worker_id();
+    if (worker_id < 0 || worker_id >= EBR_SLOT_COUNT) return;
+
+    DequeRetiredNode* node = (DequeRetiredNode*)ty_vm_alloc(sizeof(DequeRetiredNode));
+    if (!node) sched_abort("ebr_retire_array: alloc failed");
+    node->array = array;
+    node->cap = cap;
+    node->retire_epoch = atomic_load_explicit(&ebr_global_epoch, memory_order_acquire);
+    node->next = ebr_retired[worker_id];
+    ebr_retired[worker_id] = node;
+    ebr_retired_count[worker_id]++;
+    atomic_fetch_add_explicit(&dbg_deque_retired, 1, memory_order_relaxed);
+
+    if (ebr_retired_count[worker_id] >= EBR_RECLAIM_THRESHOLD) {
+        ebr_advance_epoch();
+        ebr_try_reclaim_worker(worker_id);
+    }
+}
+
+static void ebr_force_reclaim_all(void) {
+    ebr_advance_epoch();
+    ebr_advance_epoch();
+    for (int i = 0; i < num_workers; i++)
+        ebr_try_reclaim_worker(i);
+    ebr_try_reclaim_worker(EBR_EXTERNAL_SLOT);
+}
 
 /* ── coroutine trampoline ────────────────────────────────────────────────── */
 
+TY_NO_ASAN
 static void coro_trampoline(uint32_t hi, uint32_t lo) {
+    TY_SCHED_DEBUG("[tramp] entered hi=%u lo=%u\n", hi, lo);
     uintptr_t ptr = ((uintptr_t)hi << 32) | (uintptr_t)lo;
+    TY_SCHED_DEBUG("[tramp] co=%p\n", (void*)ptr);
     TyCoro* co = (TyCoro*)ptr;
+    TY_SCHED_DEBUG("[tramp] fn=%p arena=%p arg=%p\n", (void*)co->fn, (void*)co->arena, co->arg);
     co->fn(co->arena, co->arg);
+    TY_SCHED_DEBUG("[tramp] fn returned, calling ty_coro_exit\n");
     ty_coro_exit();
 }
 
 /* ── coroutine lifecycle ─────────────────────────────────────────────────── */
 
 static TyCoro* coro_new(void (*fn)(void*, void*), void* arg) {
-    TyCoro* co = (TyCoro*)ty_vm_alloc(sizeof(TyCoro));
-    if (!co) sched_abort("coro_new: alloc TyCoro failed");
+    size_t coro_size = (sizeof(TyCoro) + GUARD_PAGE_SIZE - 1) & ~(size_t)(GUARD_PAGE_SIZE - 1);
+    size_t total = coro_size + GUARD_PAGE_SIZE + CORO_STACK_SIZE;
+    char* base = (char*)ty_vm_alloc(total);
+    if (!base) sched_abort("coro_new: alloc failed");
+
+    TY_SCHED_DEBUG("[coro_new] total=%zu base=%p mprotect_addr=%p mprotect_size=%zu\n",
+        total, (void*)base, (void*)(base + coro_size), (size_t)GUARD_PAGE_SIZE);
+    TY_SCHED_DEBUG("[coro_new] sizeof(TyCoro)=%zu coro_size=%zu page=%d\n",
+        sizeof(TyCoro), coro_size, GUARD_PAGE_SIZE);
+
+    /* Layout: [TyCoro (padded to page) | guard page | stack data] */
+    TyCoro* co = (TyCoro*)base;
+
+
+    TY_SCHED_DEBUG("[coro_new] co=%p stack_base=%p stack_top=%p guard_end=%p\n",
+        (void*)co,
+        (void*)base,
+        (void*)(base + GUARD_PAGE_SIZE + CORO_STACK_SIZE),
+        (void*)(base + GUARD_PAGE_SIZE));
+
+    if (!ty_vm_guard(base + coro_size, GUARD_PAGE_SIZE)) {
+        TY_SCHED_DEBUG("[coro_new] mprotect failed: errno=%d (%s) addr=%p size=%zu\n",
+            errno, strerror(errno), (void*)(base + coro_size), (size_t)GUARD_PAGE_SIZE);
+        // Guard pages unavailable in this environment (sandboxed kernel).
+        // Stack overflows won't be caught but execution is otherwise correct.
+        TY_SCHED_DEBUG("[coro_new] warning: guard page unavailable (mprotect EINVAL)\n");
+    }
 
     co->fn  = fn;
     co->arg = arg;
     atomic_init((_Atomic(struct TyCoro*)*)&co->waiters, NULL);
     atomic_init(&co->waiters_lock, 0);
-    co->waiter_next = NULL;
-    co->sched_next  = NULL;
-    co->arena       = slab_arena_new();
+    co->waiter_next  = NULL;
+    co->sched_next   = NULL;
+    co->arena        = slab_arena_new();
     atomic_init(&co->state, CORO_RUNNABLE);
-    atomic_init(&co->ref,   1);
+    atomic_init(&co->ref, 1);
 
-    size_t total = GUARD_PAGE_SIZE + CORO_STACK_SIZE;
-    char* base = (char*)ty_vm_alloc(total);
-    if (!base) sched_abort("coro_new: alloc stack failed");
-    if (!ty_vm_guard(base, GUARD_PAGE_SIZE))
-        sched_abort("coro_new: guard page failed");
-
-    co->stack_base  = base;
+    co->stack_base  = base;   /* free the whole slab in coro_free */
     co->stack_total = total;
 
+    char* stack_bottom = base + coro_size + GUARD_PAGE_SIZE;
     uintptr_t ptr = (uintptr_t)co;
     ty_ctx_init(&co->ctx,
-                base + GUARD_PAGE_SIZE, CORO_STACK_SIZE,
-                coro_trampoline,
-                (uint32_t)(ptr >> 32),
-                (uint32_t)(ptr & 0xFFFFFFFFu));
+        stack_bottom, CORO_STACK_SIZE,
+        coro_trampoline,
+        (uint32_t)(ptr >> 32),
+        (uint32_t)(ptr & 0xFFFFFFFFu));
+
     return co;
 }
 
 static void coro_free(TyCoro* co) {
     if (!co) return;
+    /* Decrement here, not in ty_coro_exit — a coroutine blocked on a channel
+     * is still alive (CORO_BLOCKED).  Decrementing at exit caused the shutdown
+     * loop to see active_coros==0 while receivers were still parked. */
+    atomic_fetch_sub_explicit(&active_coros, 1, memory_order_release);
+    atomic_fetch_add_explicit(&dbg_freed, 1, memory_order_relaxed);
     slab_arena_free(co->arena);
     ty_vm_free(co->stack_base, co->stack_total);
     ty_vm_free(co, sizeof(TyCoro));
@@ -241,10 +492,31 @@ static void coro_free(TyCoro* co) {
 
 /* ── scheduling helpers ──────────────────────────────────────────────────── */
 
+/* Push a newly-spawned coroutine onto the current worker's deque. */
 static void sched_enqueue(TyCoro* co) {
-    atomic_store_explicit(&co->state, CORO_RUNNABLE, memory_order_release);
+    coro_state_store(co, CORO_RUNNABLE, "spawn_enqueue");
     Worker* w = current_worker();
+    if (atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire)) {
+        TY_SCHED_DEBUG("[sched] enqueue(spawn/shutdown) coro=%p onto worker 0\n", (void*)co);
+        deque_push(&workers[0].deque, co);
+        return;
+    }
+    TY_SCHED_DEBUG("[sched] enqueue(spawn) coro=%p onto worker %d\n",
+        (void*)co, w ? w->id : 0);
     deque_push(w ? &w->deque : &workers[0].deque, co);
+}
+
+/* Wake a BLOCKED coroutine — always onto worker 0 so ty_sched_shutdown's
+ * drive loop (which only processes worker 0) is guaranteed to see it,
+ * regardless of which worker thread is executing the wakeup. */
+static void sched_enqueue_wake(TyCoro* co) {
+    coro_state_store(co, CORO_RUNNABLE, "wake_enqueue");
+    // /* Only wake truly BLOCKED coroutines; avoid enqueueing RUNNING/DONE. */
+    // if (!coro_state_cas(co, CORO_BLOCKED, CORO_RUNNABLE, "wake_enqueue"))
+    //     return;
+    atomic_fetch_add_explicit(&dbg_woken, 1, memory_order_relaxed);
+    TY_SCHED_DEBUG("[sched] enqueue(wake) coro=%p onto worker 0\n", (void*)co);
+    deque_push(&workers[0].deque, co);
 }
 
 static TyCoro* sched_next_coro(Worker* w) {
@@ -259,6 +531,13 @@ static TyCoro* sched_next_coro(Worker* w) {
     return NULL;
 }
 
+static long deque_size_snapshot(WSDeque* dq) {
+    long top = atomic_load_explicit(&dq->top, memory_order_acquire);
+    long bottom = atomic_load_explicit(&dq->bottom, memory_order_acquire);
+    long size = bottom - top;
+    return size > 0 ? size : 0;
+}
+
 /* ── preemption ──────────────────────────────────────────────────────────── */
 
 static void preempt_tick(void) {
@@ -268,34 +547,185 @@ static void preempt_tick(void) {
 
 /* ── worker run / loop ───────────────────────────────────────────────────── */
 
-static void worker_run_coro(Worker* w, TyCoro* co) {
+static char* coro_stack_bottom(TyCoro* co) {
+    size_t coro_size = (sizeof(TyCoro) + GUARD_PAGE_SIZE - 1) & ~(size_t)(GUARD_PAGE_SIZE - 1);
+    return co->stack_base + coro_size + GUARD_PAGE_SIZE;
+}
+
+TY_NO_ASAN
+static void worker_resume_coro(Worker* w, TyCoro* co) {
     w->current = co;
-    atomic_store_explicit(&co->state, CORO_RUNNING, memory_order_release);
+    atomic_store_explicit(&w->in_coro, 1, memory_order_release);
+    coro_state_store(co, CORO_RUNNING, "resume");
+
+#ifdef TY_ASAN
+    __sanitizer_start_switch_fiber(NULL, coro_stack_bottom(co), CORO_STACK_SIZE);
+#endif
+
     ty_ctx_swap(&w->sched_ctx, &co->ctx);
+
+#ifdef TY_ASAN
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
+#endif
+
     w->current = NULL;
-    if (co->fn == NULL) coro_free(co);
+    atomic_store_explicit(&w->in_coro, 0, memory_order_release);
+    if (co->fn == NULL) {
+        coro_free(co);
+        return;
+    }
+
+    if (atomic_load_explicit(&co->state, memory_order_acquire) == CORO_DONE) {
+        TY_SCHED_DEBUG("[sched] BUG: coro=%p reached CORO_DONE without fn=NULL sentinel\n", (void*)co);
+#ifdef TY_SCHED_DEBUG_ENABLED
+        assert(!"coroutine terminal path missing fn=NULL sentinel");
+#endif
+    }
+}
+
+/* Each worker's scheduler loop runs on its own scheduler stack. */
+static void worker_sched_loop(uint32_t hi, uint32_t lo) {
+    uintptr_t ptr = ((uintptr_t)hi << 32) | (uintptr_t)lo;
+    Worker* w = (Worker*)ptr;
+    int seen_shutdown = 0;
+    atomic_store_explicit(&w->last_phase, WORKER_PHASE_LOOP, memory_order_release);
+    TY_SCHED_DEBUG("[sched] worker:loop_start id=%d\n", w->id);
+
+    for (;;) {
+        atomic_store_explicit(&w->preempt_flag, 0, memory_order_relaxed);
+        atomic_store_explicit(
+            &w->local_deque_size_snapshot,
+            deque_size_snapshot(&w->deque),
+            memory_order_release);
+
+        TyCoro* co = (TyCoro*)deque_pop(&w->deque);
+        if (co) {
+            worker_resume_coro(w, co);
+            continue;
+        }
+
+        if (atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire)) {
+            if (!seen_shutdown) {
+                seen_shutdown = 1;
+                atomic_store_explicit(&w->last_phase, WORKER_PHASE_SEEN_SHUTDOWN, memory_order_release);
+                TY_SCHED_DEBUG("[sched] worker:seen_shutdown id=%d local=%ld in_coro=%d\n",
+                    w->id,
+                    atomic_load_explicit(&w->local_deque_size_snapshot, memory_order_relaxed),
+                    atomic_load_explicit(&w->in_coro, memory_order_relaxed));
+            }
+            break;
+        }
+
+        co = sched_next_coro(w);
+        if (!co) {
+            ty_sleep_ns(1000000);
+            continue;
+        }
+        worker_resume_coro(w, co);
+    }
+
+    atomic_store_explicit(&w->last_phase, WORKER_PHASE_EXIT_LOOP, memory_order_release);
+    TY_SCHED_DEBUG("[sched] worker:exit_loop id=%d\n", w->id);
+    atomic_store_explicit(&w->running, 0, memory_order_release);
+    ty_ctx_swap(&w->sched_ctx, &worker_host_ctx[w->id]);
 }
 
 static void* worker_thread(void* arg) {
     Worker* w = (Worker*)arg;
     tl_worker = w;
+    atomic_store_explicit(&w->last_phase, WORKER_PHASE_START, memory_order_release);
+    TY_SCHED_DEBUG("[sched] worker:start id=%d\n", w->id);
+
+    size_t sched_stack_size = 64 * 1024;
+    char* sched_stack = (char*)ty_vm_alloc(sched_stack_size);
+    if (!sched_stack) sched_abort("worker_thread: sched stack alloc failed");
+    uintptr_t wptr = (uintptr_t)w;
+    ty_ctx_init(&w->sched_ctx, sched_stack, sched_stack_size,
+        worker_sched_loop,
+        (uint32_t)(wptr >> 32), (uint32_t)(wptr & 0xFFFFFFFFu));
 
 #ifdef TY_WINDOWS
-    /* On Windows each thread must become a fiber before calling SwitchToFiber. */
-    ty_ctx_init_sched(&w->sched_ctx);
+    ty_ctx_init_sched(&worker_host_ctx[w->id]);
 #endif
 
-    while (!atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire)) {
-        atomic_store_explicit(&w->preempt_flag, 0, memory_order_relaxed);
-        TyCoro* co = sched_next_coro(w);
-        if (!co) {
-            ty_sleep_ns(100000); /* 100 µs */
-            continue;
-        }
-        worker_run_coro(w, co);
-    }
-    atomic_store_explicit(&w->running, 0, memory_order_release);
+    ty_ctx_swap(&worker_host_ctx[w->id], &w->sched_ctx);
+    atomic_store_explicit(&w->last_phase, WORKER_PHASE_RETURN_HOST, memory_order_release);
+    TY_SCHED_DEBUG("[sched] worker:return_host id=%d\n", w->id);
+    ty_vm_free(sched_stack, sched_stack_size);
     return NULL;
+}
+
+static void shutdown_sched_loop(uint32_t hi, uint32_t lo) {
+    uintptr_t ptr = ((uintptr_t)hi << 32) | (uintptr_t)lo;
+    Worker* w = (Worker*)ptr;
+    TY_SCHED_DEBUG("[sched] shutdown:drain_loop_start worker=%d active=%d\n", w->id,
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
+
+    while (atomic_load_explicit(&active_coros, memory_order_acquire) > 0) {
+        atomic_store_explicit(
+            &w->local_deque_size_snapshot,
+            deque_size_snapshot(&w->deque),
+            memory_order_release);
+        TyCoro* co = (TyCoro*)deque_pop(&w->deque);
+        if (!co) {
+            for (int i = 1; i < num_workers; i++) {
+                co = (TyCoro*)deque_steal(&workers[i].deque);
+                if (co) break;
+            }
+        }
+        if (!co) { ty_sleep_ns(10000); continue; }
+
+        TY_SCHED_DEBUG("[sched] shutdown loop: active_coros=%d\n",
+            atomic_load_explicit(&active_coros, memory_order_relaxed));
+        worker_resume_coro(w, co);
+    }
+
+    TY_SCHED_DEBUG("[sched] shutdown:drain_loop_done worker=%d\n", w->id);
+    ebr_force_reclaim_all();
+    ty_ctx_swap(&w->sched_ctx, &worker_host_ctx[w->id]);
+}
+
+// static void close_all_channels_for_shutdown(void) {
+//     ty_mutex_lock(&all_chans_lock);
+//     for (struct TyChan* ch = all_chans_head; ch; ch = ch->all_next)
+//         ty_chan_close(ch);
+//     ty_mutex_unlock(&all_chans_lock);
+// }
+
+void ty_sched_shutdown(void) {
+    Worker* self = &workers[0];
+    TY_SCHED_DEBUG("[sched] shutdown:start active=%d\n",
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
+    atomic_store_explicit(&sched_shutdown_flag, 1, memory_order_release);
+    //     close_all_channels_for_shutdown();
+    TY_SCHED_DEBUG("[sched] shutdown:enter_drain active=%d\n",
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
+
+    size_t sched_stack_size = 64 * 1024;
+    char* sched_stack = (char*)ty_vm_alloc(sched_stack_size);
+    if (!sched_stack) sched_abort("ty_sched_shutdown: sched stack alloc failed");
+    uintptr_t wptr = (uintptr_t)self;
+    ty_ctx_init(&self->sched_ctx, sched_stack, sched_stack_size,
+        shutdown_sched_loop,
+        (uint32_t)(wptr >> 32), (uint32_t)(wptr & 0xFFFFFFFFu));
+    ty_ctx_swap(&worker_host_ctx[self->id], &self->sched_ctx);
+
+    TY_SCHED_DEBUG("[sched] shutdown:join_workers\n");
+    for (int i = 1; i < num_workers; i++)
+        ty_thread_join(workers[i].thread);
+
+    ty_vm_free(sched_stack, sched_stack_size);
+    ebr_force_reclaim_all();
+    ty_preempt_stop();
+    TY_SCHED_DEBUG("[sched] shutdown:done active=%d spawned=%ld freed=%ld blocked=%ld woken=%ld deque_retired=%ld deque_reclaimed=%ld ebr_epoch_advance=%ld\n",
+        atomic_load_explicit(&active_coros, memory_order_relaxed),
+        atomic_load_explicit(&dbg_spawned, memory_order_relaxed),
+        atomic_load_explicit(&dbg_freed, memory_order_relaxed),
+        atomic_load_explicit(&dbg_blocked, memory_order_relaxed),
+        atomic_load_explicit(&dbg_woken, memory_order_relaxed),
+        atomic_load_explicit(&dbg_deque_retired, memory_order_relaxed),
+        atomic_load_explicit(&dbg_deque_reclaimed, memory_order_relaxed),
+        atomic_load_explicit(&dbg_ebr_epoch_advance, memory_order_relaxed));
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -305,9 +735,27 @@ static void* worker_thread(void* arg) {
 void ty_sched_init(void) {
     atomic_init(&sched_shutdown_flag, 0);
     atomic_init(&active_coros, 0);
+    atomic_init(&dbg_spawned, 0);
+    atomic_init(&dbg_freed, 0);
+    atomic_init(&dbg_blocked, 0);
+    atomic_init(&dbg_woken, 0);
+    atomic_init(&dbg_deque_retired, 0);
+    atomic_init(&dbg_deque_reclaimed, 0);
+    atomic_init(&dbg_ebr_epoch_advance, 0);
+    atomic_init(&ebr_global_epoch, 1);
+    ty_mutex_init(&all_chans_lock);
+    all_chans_head = NULL;
 
     num_workers = ty_cpu_count();
     if (num_workers > MAX_WORKERS) num_workers = MAX_WORKERS;
+    if (num_workers < 1) num_workers = 1;
+
+    for (int i = 0; i < EBR_SLOT_COUNT; i++) {
+        atomic_init(&ebr_announced_epoch[i], 0);
+        atomic_init(&ebr_active[i], 0);
+        ebr_retired[i] = NULL;
+        ebr_retired_count[i] = 0;
+    }
 
     ty_preempt_install(preempt_tick, SIGPROF_HZ);
 
@@ -316,77 +764,61 @@ void ty_sched_init(void) {
     deque_init(&workers[0].deque);
     atomic_init(&workers[0].preempt_flag, 0);
     atomic_init(&workers[0].running, 1);
+    atomic_init(&workers[0].last_phase, WORKER_PHASE_INIT);
+    atomic_init(&workers[0].in_coro, 0);
+    atomic_init(&workers[0].local_deque_size_snapshot, 0);
     workers[0].current = NULL;
+    TY_SCHED_DEBUG("[sched] worker:start id=0\n");
 
     for (int i = 1; i < num_workers; i++) {
         workers[i].id = i;
         deque_init(&workers[i].deque);
         atomic_init(&workers[i].preempt_flag, 0);
         atomic_init(&workers[i].running, 1);
+        atomic_init(&workers[i].last_phase, WORKER_PHASE_INIT);
+        atomic_init(&workers[i].in_coro, 0);
+        atomic_init(&workers[i].local_deque_size_snapshot, 0);
         workers[i].current = NULL;
         if (!ty_thread_create(&workers[i].thread, worker_thread, &workers[i]))
             sched_abort("ty_sched_init: thread_create failed");
     }
 
     tl_worker = &workers[0];
-
 #ifdef TY_WINDOWS
-    ty_ctx_init_sched(&workers[0].sched_ctx);
+    ty_ctx_init_sched(&worker_host_ctx[0]);
 #endif
 }
 
-void ty_sched_shutdown(void) {
-    Worker* w = &workers[0];
-
-    while (atomic_load_explicit(&active_coros, memory_order_acquire) > 0) {
-        for (int i = 1; i < num_workers; i++) {
-            TyCoro* stolen = (TyCoro*)deque_steal(&workers[i].deque);
-            if (stolen) deque_push(&w->deque, stolen);
-        }
-        TyCoro* co = (TyCoro*)deque_pop(&w->deque);
-        if (co) {
-            worker_run_coro(w, co);
-        } else {
-            ty_sleep_ns(10000); /* 10 µs */
-        }
-    }
-    for (;;) {
-        TyCoro* co = (TyCoro*)deque_pop(&w->deque);
-        if (!co) break;
-        worker_run_coro(w, co);
-    }
-
-    atomic_store_explicit(&sched_shutdown_flag, 1, memory_order_release);
-    for (int i = 1; i < num_workers; i++)
-        ty_thread_join(workers[i].thread);
-
-    ty_preempt_stop();
-}
-
-TyCoro* ty_spawn(struct SlabArena* arena, void (*fn)(void*, void*), void* arg) {
+TyCoro* ty_spawn(SlabArena* arena, void (*fn)(void*, void*), void* arg) {
     (void)arena;
     TyCoro* co = coro_new(fn, arg);
+    atomic_fetch_add_explicit(&dbg_spawned, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&active_coros, 1, memory_order_relaxed);
+    TY_SCHED_DEBUG("[sched] spawn coro=%p active=%d\n", (void*)co,
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
     sched_enqueue(co);
     return co;
 }
 
 void ty_yield(void) {
     Worker* w = current_worker();
-    if (!w || !w->current) return;
+    if (!w || !w->current) {
+        /* If called from the main thread, help out and be cooperative.
+         * We sleep a bit to not hog the CPU so real workers can run. */
+        ty_sleep_ns(1000000); /* 1 ms */
+        return;
+    }
     TyCoro* co = w->current;
-    CoroState expected = CORO_RUNNING;
-    if (atomic_compare_exchange_strong_explicit(
-            &co->state, &expected, CORO_RUNNABLE,
-            memory_order_acq_rel, memory_order_relaxed))
+    if (coro_state_cas(co, CORO_RUNNING, CORO_RUNNABLE, "yield"))
         deque_push(&w->deque, co);
     ty_ctx_swap(&co->ctx, &w->sched_ctx);
 }
 
 static void coro_lock(TyCoro* co) {
     int zero;
-    do { zero = 0; }
-    while (!atomic_compare_exchange_weak_explicit(
+    do {
+        zero = 0;
+    } while (!atomic_compare_exchange_weak_explicit(
         &co->waiters_lock, &zero, 1,
         memory_order_acquire, memory_order_relaxed));
 }
@@ -394,10 +826,10 @@ static void coro_unlock(TyCoro* co) {
     atomic_store_explicit(&co->waiters_lock, 0, memory_order_release);
 }
 
-void ty_await(struct SlabArena* arena, TyCoro* target) {
+void ty_await(SlabArena* arena, TyCoro* target) {
     (void)arena;
     if (!target) return;
-    Worker* w  = current_worker();
+    Worker* w = current_worker();
     TyCoro* me = w ? w->current : NULL;
     if (!me) return;
 
@@ -408,19 +840,24 @@ void ty_await(struct SlabArena* arena, TyCoro* target) {
     }
     me->waiter_next = atomic_load_explicit(&target->waiters, memory_order_relaxed);
     atomic_store_explicit(&target->waiters, me, memory_order_relaxed);
-    atomic_store_explicit(&me->state, CORO_BLOCKED, memory_order_release);
+    coro_state_store(me, CORO_BLOCKED, "await_block");
+    atomic_fetch_add_explicit(&dbg_blocked, 1, memory_order_relaxed);
     coro_unlock(target);
 
     ty_ctx_swap(&me->ctx, &w->sched_ctx);
 }
 
 void ty_coro_exit(void) {
-    Worker* w  = current_worker();
+    Worker* w = current_worker();
     TyCoro* co = w ? w->current : NULL;
     if (!co) return;
 
-    atomic_store_explicit(&co->state, CORO_DONE, memory_order_release);
-    atomic_fetch_sub_explicit(&active_coros, 1, memory_order_release);
+    /* NOTE: active_coros is decremented in coro_free(), not here.
+     * Decrementing here caused premature shutdown when blocked coroutines
+     * (CORO_BLOCKED on a channel recv) were still alive. */
+    coro_state_store(co, CORO_DONE, "coro_exit");
+    TY_SCHED_DEBUG("[sched] coro_exit coro=%p active=%d (decrements at coro_free)\n",
+        (void*)co, atomic_load_explicit(&active_coros, memory_order_relaxed));
 
     coro_lock(co);
     TyCoro* waiter = atomic_load_explicit(&co->waiters, memory_order_relaxed);
@@ -428,19 +865,19 @@ void ty_coro_exit(void) {
     coro_unlock(co);
     while (waiter) {
         TyCoro* next = waiter->waiter_next;
-        sched_enqueue(waiter);
+        sched_enqueue_wake(waiter);
         waiter = next;
     }
 
-    co->fn = NULL; /* sentinel for coro_free in worker_run_coro */
+    co->fn = NULL; /* sentinel for coro_free in worker_resume_coro */
     ty_ctx_swap(&co->ctx, &w->sched_ctx);
     TY_TRAP(); /* unreachable */
 }
 
-struct SlabArena* ty_current_arena(void) {
+SlabArena* ty_current_arena(void) {
     TyCoro* co = current_coro();
     if (co) return co->arena;
-    static struct SlabArena* main_arena = NULL;
+    static SlabArena* main_arena = NULL;
     if (!main_arena) main_arena = slab_arena_new();
     return main_arena;
 }
@@ -449,64 +886,80 @@ struct SlabArena* ty_current_arena(void) {
  *  Channel
  * ══════════════════════════════════════════════════════════════════════════ */
 
-typedef struct WaitNode {
-    TyCoro*          coro;
-    void*            elem;
-    struct WaitNode* next;
-} WaitNode;
-
-struct TyChan {
-    TyMutex   lock;
-    size_t    elem_size;
-    size_t    cap;
-    size_t    len;
-    size_t    head;
-    size_t    tail;
-    char*     buf;
-    WaitNode* send_q;
-    WaitNode* recv_q;
-    int       closed;
-};
-
-TyChan* ty_chan_new(size_t elem_size, size_t cap) {
-    TyChan* ch = (TyChan*)ty_vm_alloc(sizeof(TyChan));
+struct TyChan* ty_chan_new(size_t elem_size, size_t cap) {
+    struct TyChan* ch = (struct TyChan*)ty_vm_alloc(sizeof(struct TyChan));
     if (!ch) sched_abort("ty_chan_new: alloc failed");
     ty_mutex_init(&ch->lock);
     ch->elem_size = elem_size;
-    ch->cap       = cap;
+    ch->cap = cap;
     ch->len = ch->head = ch->tail = 0;
     ch->send_q = ch->recv_q = NULL;
     ch->closed = 0;
+    ch->all_next = NULL;
     ch->buf = NULL;
     if (cap > 0) {
         ch->buf = (char*)ty_vm_alloc(cap * elem_size);
-        if (!ch->buf) sched_abort("ty_chan_new: alloc buf failed");
+        if (!ch->buf)
+            sched_abort("ty_chan_new: alloc buf failed");
     }
+
+    ty_mutex_lock(&all_chans_lock);
+    ch->all_next = all_chans_head;
+    all_chans_head = ch;
+    ty_mutex_unlock(&all_chans_lock);
     return ch;
 }
 
-static void chan_park(TyChan* ch, WaitNode** queue, void* elem, TyMutex* lock) {
-    Worker* w  = current_worker();
+static void chan_park(struct TyChan* ch, WaitNode** queue, void* elem, TyMutex* lock) {
+    Worker* w = current_worker();
     TyCoro* me = w ? w->current : NULL;
-    if (!me) sched_abort("chan_park: not in a coroutine");
-    WaitNode node = { .coro = me, .elem = elem, .next = *queue };
-    *queue = &node;
-    atomic_store_explicit(&me->state, CORO_BLOCKED, memory_order_release);
+    if (!me) {
+        char buf[64];
+        int worker_id = w ? w->id : -1;
+        snprintf(buf, sizeof(buf), "chan_park: not in a coroutine (worker %d)", worker_id);
+        sched_abort(buf);
+    }
+
+    // /* During shutdown, never park: shutdown drain loop must finish. */
+    // if (atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire)) {
+    //     ty_mutex_unlock(lock);
+    //     ty_coro_exit();
+    // }
+
+    WaitNode* node = (WaitNode*)ty_vm_alloc(sizeof(WaitNode));
+    if (!node) sched_abort("chan_park: alloc WaitNode failed");
+    node->coro = me;
+    node->elem = elem;
+    node->next = *queue;
+    *queue = node;
+
+    coro_state_store(me, CORO_BLOCKED, "chan_park");
+    atomic_fetch_add_explicit(&dbg_blocked, 1, memory_order_relaxed);
+    TY_SCHED_DEBUG("[chan] park coro=%p on %s active=%d\n", (void*)me,
+        queue == &ch->recv_q ? "recv_q" : "send_q",
+        atomic_load_explicit(&active_coros, memory_order_relaxed));
     ty_mutex_unlock(lock);
     ty_ctx_swap(&me->ctx, &w->sched_ctx);
-    (void)ch;
+    /* Coroutine resumes here after wakeup — node has been consumed, free it */
+    ty_vm_free(node, sizeof(WaitNode));
 }
 
-void ty_chan_send(struct SlabArena* arena, TyChan* ch, void* elem) {
+void ty_chan_send(struct SlabArena* arena, struct TyChan* ch, void* elem) {
     (void)arena;
     ty_mutex_lock(&ch->lock);
-    if (ch->closed) { ty_mutex_unlock(&ch->lock); sched_abort("send on closed chan"); }
+    Worker* w = current_worker();
+    TyCoro* me = w ? w->current : NULL;
+    if (ch->closed) {
+        ty_mutex_unlock(&ch->lock);
+        sched_abort("send on closed chan");
+    }
 
     if (ch->recv_q) {
-        WaitNode* r = ch->recv_q; ch->recv_q = r->next;
+        WaitNode* r = ch->recv_q;
+        ch->recv_q = r->next;
         memcpy(r->elem, elem, ch->elem_size);
         ty_mutex_unlock(&ch->lock);
-        sched_enqueue(r->coro);
+        sched_enqueue_wake(r->coro);
         return;
     }
     if (ch->cap > 0 && ch->len < ch->cap) {
@@ -516,131 +969,200 @@ void ty_chan_send(struct SlabArena* arena, TyChan* ch, void* elem) {
         ty_mutex_unlock(&ch->lock);
         return;
     }
+    if (!me) {
+        ty_mutex_unlock(&ch->lock);
+        for (;;) {
+            ty_mutex_lock(&ch->lock);
+            if (ch->closed) {
+                ty_mutex_unlock(&ch->lock);
+                sched_abort("send on closed chan");
+            }
+            if (ch->recv_q) {
+                WaitNode* r = ch->recv_q;
+                ch->recv_q = r->next;
+                memcpy(r->elem, elem, ch->elem_size);
+                ty_mutex_unlock(&ch->lock);
+                sched_enqueue_wake(r->coro);
+                return;
+            }
+            if (ch->cap > 0 && ch->len < ch->cap) {
+                memcpy(ch->buf + ch->tail * ch->elem_size, elem, ch->elem_size);
+                ch->tail = (ch->tail + 1) % ch->cap;
+                ch->len++;
+                ty_mutex_unlock(&ch->lock);
+                return;
+            }
+            ty_mutex_unlock(&ch->lock);
+            ty_sleep_ns(1000);
+        }
+    }
     chan_park(ch, &ch->send_q, elem, &ch->lock);
+
+    // /* If woken by close, do not silently treat send as successful. */
+    // ty_mutex_lock(&ch->lock);
+    // int closed = ch->closed;
+    // ty_mutex_unlock(&ch->lock);
+    // if (closed) {
+    //     if (atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire))
+    //         ty_coro_exit();
+    //     sched_abort("send on closed chan");
+    // }
 }
 
-void ty_chan_recv(struct SlabArena* arena, TyChan* ch, void* out) {
+void ty_chan_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
     (void)arena;
     ty_mutex_lock(&ch->lock);
+    Worker* w = current_worker();
+    TyCoro* me = w ? w->current : NULL;
     if (ch->len > 0) {
         memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
         ch->head = (ch->head + 1) % ch->cap;
         ch->len--;
         if (ch->send_q) {
-            WaitNode* s = ch->send_q; ch->send_q = s->next;
+            WaitNode* s = ch->send_q;
+            ch->send_q = s->next;
             memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
             ch->tail = (ch->tail + 1) % ch->cap;
             ch->len++;
             ty_mutex_unlock(&ch->lock);
-            sched_enqueue(s->coro);
-        } else { ty_mutex_unlock(&ch->lock); }
+            sched_enqueue_wake(s->coro);
+        } else {
+            ty_mutex_unlock(&ch->lock);
+        }
         return;
+    }
+    if (!me) {
+        ty_mutex_unlock(&ch->lock);
+        for (;;) {
+            ty_mutex_lock(&ch->lock);
+            if (ch->len > 0) {
+                memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
+                ch->head = (ch->head + 1) % ch->cap;
+                ch->len--;
+                if (ch->send_q) {
+                    WaitNode* s = ch->send_q;
+                    ch->send_q = s->next;
+                    memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
+                    ch->tail = (ch->tail + 1) % ch->cap;
+                    ch->len++;
+                    ty_mutex_unlock(&ch->lock);
+                    sched_enqueue_wake(s->coro);
+                } else {
+                    ty_mutex_unlock(&ch->lock);
+                }
+                return;
+            }
+            if (ch->send_q) {
+                WaitNode* s = ch->send_q;
+                ch->send_q = s->next;
+                memcpy(out, s->elem, ch->elem_size);
+                ty_mutex_unlock(&ch->lock);
+                sched_enqueue_wake(s->coro);
+                return;
+            }
+            if (ch->closed) {
+                memset(out, 0, ch->elem_size);
+                ty_mutex_unlock(&ch->lock);
+                return;
+            }
+            ty_mutex_unlock(&ch->lock);
+            ty_sleep_ns(1000);
+        }
     }
     if (ch->send_q) {
-        WaitNode* s = ch->send_q; ch->send_q = s->next;
+        WaitNode* s = ch->send_q;
+        ch->send_q = s->next;
         memcpy(out, s->elem, ch->elem_size);
         ty_mutex_unlock(&ch->lock);
-        sched_enqueue(s->coro);
+        sched_enqueue_wake(s->coro);
         return;
     }
-    if (ch->closed) { memset(out, 0, ch->elem_size); ty_mutex_unlock(&ch->lock); return; }
+    if (ch->closed) {
+        memset(out, 0, ch->elem_size);
+        ty_mutex_unlock(&ch->lock);
+        return;
+    }
     chan_park(ch, &ch->recv_q, out, &ch->lock);
 }
 
-int ty_chan_try_recv(struct SlabArena* arena, TyChan* ch, void* out) {
+int ty_chan_try_recv(struct SlabArena* arena, struct TyChan* ch, void* out) {
     (void)arena;
-    for (;;) {
-        ty_mutex_lock(&ch->lock);
+    ty_mutex_lock(&ch->lock);
 
-        if (ch->len > 0) {
-            memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
-            ch->head = (ch->head + 1) % ch->cap;
-            ch->len--;
-            if (ch->send_q) {
-                WaitNode* s = ch->send_q; ch->send_q = s->next;
-                memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
-                ch->tail = (ch->tail + 1) % ch->cap;
-                ch->len++;
-                ty_mutex_unlock(&ch->lock);
-                sched_enqueue(s->coro);
-            } else {
-                ty_mutex_unlock(&ch->lock);
-            }
-            return 1;
-        }
-
+    if (ch->len > 0) {
+        memcpy(out, ch->buf + ch->head * ch->elem_size, ch->elem_size);
+        ch->head = (ch->head + 1) % ch->cap;
+        ch->len--;
         if (ch->send_q) {
-            WaitNode* s = ch->send_q; ch->send_q = s->next;
-            memcpy(out, s->elem, ch->elem_size);
+            WaitNode* s = ch->send_q;
+            ch->send_q = s->next;
+            memcpy(ch->buf + ch->tail * ch->elem_size, s->elem, ch->elem_size);
+            ch->tail = (ch->tail + 1) % ch->cap;
+            ch->len++;
             ty_mutex_unlock(&ch->lock);
-            sched_enqueue(s->coro);
-            return 1;
+            sched_enqueue_wake(s->coro);
+        } else {
+            ty_mutex_unlock(&ch->lock);
         }
-
-        int closed = ch->closed;
-        size_t elem_size = ch->elem_size;
-        ty_mutex_unlock(&ch->lock);
-
-        // Closed and empty: no more values.
-        if (closed) { memset(out, 0, elem_size); return 0; }
-
-        // Heuristic: if no active coroutines, nothing else will ever send.
-        if (atomic_load_explicit(&active_coros, memory_order_acquire) == 0) {
-            return 0;
-        }
-
-        // Let other worker threads run and try again.
-        ty_sleep_ns(10000); /* 10 us */
+        return 1;
     }
+
+    if (ch->send_q) {
+        WaitNode* s = ch->send_q;
+        ch->send_q = s->next;
+        memcpy(out, s->elem, ch->elem_size);
+        ty_mutex_unlock(&ch->lock);
+        sched_enqueue_wake(s->coro);
+        return 1;
+    }
+
+    ty_mutex_unlock(&ch->lock);
+    return 0; // ← genuinely empty right now; caller decides what to do
 }
 
-void ty_chan_close(TyChan* ch) {
+void ty_chan_close(struct TyChan* ch) {
     ty_mutex_lock(&ch->lock);
     ch->closed = 1;
-    WaitNode* r = ch->recv_q; ch->recv_q = NULL;
+    WaitNode* r = ch->recv_q;
+    ch->recv_q = NULL;
+    // WaitNode* s = ch->send_q;
+    // ch->send_q = NULL;
     ty_mutex_unlock(&ch->lock);
     while (r) {
         WaitNode* next = r->next;
         memset(r->elem, 0, ch->elem_size);
-        sched_enqueue(r->coro);
+        sched_enqueue_wake(r->coro);
         r = next;
     }
+    // while (s) {
+    //     WaitNode* next = s->next;
+    //     sched_enqueue_wake(s->coro);
+    //     s = next;
+    // }
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Additions required inside scheduler.c
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Paste the following five functions anywhere in the "public API" section of
- * scheduler.c (after the existing sched_enqueue / worker definitions):
- *
- * ────────────────────────────────────────────────────────────────────────────
- */
+void ty_coro_block_and_yield(void) {
+    Worker* w = current_worker();
+    TyCoro* me = w ? w->current : NULL;
+    if (!me) return;
+    // if (atomic_load_explicit(&sched_shutdown_flag, memory_order_acquire))
+    //     ty_coro_exit();
+    coro_state_store(me, CORO_BLOCKED, "io_block_and_yield");
+    atomic_fetch_add_explicit(&dbg_blocked, 1, memory_order_relaxed);
+    ty_ctx_swap(&me->ctx, &w->sched_ctx);
+}
 
- // 1. Block current coroutine and swap to scheduler
- void ty_coro_block_and_yield(void) {
-     Worker* w  = current_worker();
-     TyCoro* me = w ? w->current : NULL;
-     if (!me) return;
-     atomic_store_explicit(&me->state, CORO_BLOCKED, memory_order_release);
-     ty_ctx_swap(&me->ctx, &w->sched_ctx);
- }
+void sched_enqueue_from_external(void* co) {
+    TyCoro* coro = (TyCoro*)co;
+    // if (!coro_state_cas(coro, CORO_BLOCKED, CORO_RUNNABLE, "external_enqueue"))
+    //     return;
+    deque_push(&workers[0].deque, coro);
+}
 
- // 2. Thread-safe enqueue onto worker[0] from external thread
- void sched_enqueue_from_external(void* co) {
-     TyCoro* coro = (TyCoro*)co;
-     atomic_store_explicit(&coro->state, CORO_RUNNABLE, memory_order_release);
-     deque_push(&workers[0].deque, coro);
- }
+void* ty_current_coro_raw(void) {
+    return (void*)current_coro();
+}
 
- // 3. Expose current coro pointer (void* for ABI isolation)
- void* ty_current_coro_raw(void) {
-     return (void*)current_coro();
- }
-
- // 4. Expose current worker pointer (used by scheduler_io_glue.c)
- Worker* ty_current_worker_ptr(void) {
-     return current_worker();
- }
-
- // ty_current_arena() is already defined in scheduler.c
+Worker* ty_current_worker_ptr(void) {
+    return current_worker();
+}

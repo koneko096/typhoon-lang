@@ -7,6 +7,7 @@ struct Popcount {
 impl Popcount {
   fn check(self, even: Int32) -> Int32 {
     let ch: ref chan<Int32> = chan<Int32>();
+    let mut sent = 0;
     for x in self.ar {
       conc {
         printf("Try %d\r\n", x);
@@ -16,15 +17,14 @@ impl Popcount {
         }
         ch.send(n);
       }
+      sent += 1;
     }
 
     let mut count = 0;
-    let mut complete = false;
-    while !complete {
-      match ch.try_recv() {
-        Some(value) => { count = count + value; }
-        None => { complete = true; }
-      }
+    while sent > 0 {
+      let value = ch.recv();
+      count += value;
+      sent -= 1;
     }
     return count;
   }

@@ -21,142 +21,30 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+
 #include "platform.h"
 #include "io_driver.h"
 #include "atomic.h"
 #include "ty_mem.h"
 #include "scheduler.h"
 
-/* ── hard abort ──────────────────────────────────────────────────────────────── */
+/* ── hard abort
+ * ──────────────────────────────────────────────────────────────── */
 
 static void io_abort(void) { TY_TRAP(); }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  C-only I/O subsystem (no Rust FFI)
- * ═══════════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
 
-/* ── Opaque driver type ──────────────────────────────────────────────────────── */
-
-typedef struct IoDriver {
-    int dummy;
-} IoDriver;
-
-/* ── Per-coroutine I/O result slot ───────────────────────────────────────────── */
-
-#define IO_RESULT_TABLE_CAP  1024
-#define IO_RESULT_MASK       (IO_RESULT_TABLE_CAP - 1)
-
-typedef struct {
-    _Atomic(uintptr_t) key;
-    _Atomic(int64_t)   result;
-} IoResultSlot;
-
-static IoResultSlot io_result_table[IO_RESULT_TABLE_CAP];
-
-static void io_result_store(void* coro, int64_t result) {
-    uintptr_t key = (uintptr_t)coro;
-    uint32_t  idx = (uint32_t)(key >> 4) & IO_RESULT_MASK;
-    for (uint32_t i = 0; i < IO_RESULT_TABLE_CAP; i++) {
-        uint32_t  slot = (idx + i) & IO_RESULT_MASK;
-        uintptr_t expected = 0;
-        if (atomic_compare_exchange_strong_explicit(
-                &io_result_table[slot].key, &expected, key,
-                memory_order_acquire, memory_order_relaxed)) {
-            atomic_store_explicit(&io_result_table[slot].result,
-                                  result, memory_order_release);
-            return;
-        }
-        if (atomic_load_explicit(&io_result_table[slot].key, memory_order_relaxed) == key) {
-            atomic_store_explicit(&io_result_table[slot].result,
-                                  result, memory_order_release);
-            return;
-        }
-    }
-}
-
-static int64_t io_result_take(void* coro) {
-    uintptr_t key = (uintptr_t)coro;
-    uint32_t  idx = (uint32_t)(key >> 4) & IO_RESULT_MASK;
-    for (uint32_t i = 0; i < IO_RESULT_TABLE_CAP; i++) {
-        uint32_t slot = (idx + i) & IO_RESULT_MASK;
-        if (atomic_load_explicit(&io_result_table[slot].key,
-                                 memory_order_acquire) == key) {
-            int64_t r = atomic_load_explicit(&io_result_table[slot].result,
-                                             memory_order_acquire);
-            atomic_store_explicit(&io_result_table[slot].key,
-                                  0, memory_order_release);
-            return r;
-        }
-    }
-    return -1;
-}
-
-/* ── Global driver handle ────────────────────────────────────────────────────── */
-
-static IoDriver g_io_driver;
-
-void* ty_io_global_driver(void) { return &g_io_driver; }
-
-/* ── Subsystem init / shutdown (no-op, driver is static) ────────────────────── */
-
-void ty_io_subsystem_init(void) {
-    memset(io_result_table, 0, sizeof(io_result_table));
-}
-
-void ty_io_subsystem_shutdown(void) {
-}
-
-/* ── Park / wake callbacks (not used in blocking mode) ─────────────────────── */
-
-void ty_io_park_coro(void* task) {
-    (void)task;
-}
-
-void ty_io_wake_coro(void* coro, int64_t result) {
-    (void)coro;
-    (void)result;
-}
-
-int64_t ty_io_take_result(void* coro) {
-    (void)coro;
-    return 0;
-}
-
-/* ── Forward decls for platform functions ────────────────────────────────── */
+/* ── Forward decls for internal platform functions ──────────────────────────
+ */
 
 static int64_t io_sys_read(int fd, char* buf, size_t len);
 static int64_t io_sys_write(int fd, const char* buf, size_t len);
-
-/* ── Direct read/write (blocking, replaces Rust async versions) ──────────── */
-
-int64_t ty_io_read(
-    void* driver,
-    void* task,
-    void* coro,
-    int fd,
-    uint8_t* buf,
-    size_t len
-) {
-    (void)driver;
-    (void)task;
-    (void)coro;
-    return io_sys_read(fd, (char*)buf, len);
-}
-
-int64_t ty_io_write(
-    void* driver,
-    void* task,
-    void* coro,
-    int fd,
-    const uint8_t* buf,
-    size_t len
-) {
-    (void)driver;
-    (void)task;
-    (void)coro;
-    return io_sys_write(fd, (const char*)buf, len);
-}
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Portable low-level I/O primitives
@@ -165,7 +53,8 @@ int64_t ty_io_write(
  * symbols that used to be assumed in platform.h.  All four are implemented
  * here directly so ty_io.c has zero unresolved externals beyond the runtime
  * and scheduler symbols it already depends on.
- * ───────────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -175,8 +64,7 @@ int64_t ty_io_write(
 static int64_t io_sys_write(int fd, const char* buf, size_t len) {
     if (fd == 1 || fd == 2) {
         /* stdout/stderr — use WriteConsoleA for proper console output */
-        HANDLE h = (fd == 1) ? GetStdHandle(STD_OUTPUT_HANDLE)
-                             : GetStdHandle(STD_ERROR_HANDLE);
+        HANDLE h = (fd == 1) ? GetStdHandle(STD_OUTPUT_HANDLE) : GetStdHandle(STD_ERROR_HANDLE);
         if (h == INVALID_HANDLE_VALUE) return -1;
         DWORD written = 0;
         BOOL ok = WriteConsoleA(h, buf, (DWORD)len, &written, NULL);
@@ -215,10 +103,9 @@ static int64_t io_sys_read(int fd, char* buf, size_t len) {
     return ok ? (int64_t)got : -1;
 }
 
-#else  /* POSIX */
+#else /* POSIX */
 #  include <unistd.h>   /* read, write  */
 #  include <errno.h>
-#  include <stdlib.h>
 
 static int64_t io_sys_write(int fd, const char* buf, size_t len) {
     ssize_t n;
@@ -228,7 +115,9 @@ static int64_t io_sys_write(int fd, const char* buf, size_t len) {
 
 static int64_t io_sys_read(int fd, char* buf, size_t len) {
     ssize_t n;
-    do { n = read(fd, buf, len); } while (n < 0 && errno == EINTR);
+    do {
+        n = read(fd, buf, len);
+    } while (n < 0 && errno == EINTR);
     return (int64_t)n;
 }
 #endif /* _WIN32 */
@@ -240,13 +129,13 @@ static int64_t io_sys_read(int fd, char* buf, size_t len) {
 #   if _MSC_VER < 1900
 #       define io_snprintf _snprintf
 #   else
-        /* Even in newer MSVC, we sometimes need to include the
-           legacy definitions if the linker isn't finding the UCRT version. */
+/* Even in newer MSVC, we sometimes need to include the
+   legacy definitions if the linker isn't finding the UCRT version. */
 #       include <stdio.h>
 #       define io_snprintf snprintf
 #   endif
 #else
-    /* POSIX / GCC / Clang */
+/* POSIX / GCC / Clang */
 #   include <stdio.h>
 #   define io_snprintf snprintf
 #endif
@@ -258,7 +147,8 @@ static double io_strtod(const char* s, char** end) {
 
 /* ════════════════════════════════════════════════════════════════════════════
  *  Low-level async-aware I/O helpers
- * ════════════════════════════════════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * io_do_write
@@ -267,9 +157,9 @@ static double io_strtod(const char* s, char** end) {
  *   Retries on EINTR / short writes.
  */
 static int64_t io_do_write(int fd, const char* buf, size_t len) {
-    void*  driver = ty_io_global_driver();
-    void*  task   = ty_current_arena();    /* SlabArena* — NULL before sched */
-    void*  coro   = ty_current_coro_raw(); /* TyCoro*    — NULL outside coro  */
+    void* driver = ty_io_global_driver();
+    void* task   = ty_current_arena();    /* SlabArena* — NULL before sched */
+    void* coro   = ty_current_coro_raw(); /* TyCoro*    — NULL outside coro  */
 
     if (driver && coro) {
         /* async path */
@@ -307,7 +197,8 @@ static int64_t io_do_read(int fd, char* buf, size_t len) {
     return io_sys_read(fd, buf, len);
 }
 
-/* ── fd constants ─────────────────────────────────────────────────────────── */
+/* ── fd constants ───────────────────────────────────────────────────────────
+ */
 
 #define TY_STDIN_FD   0
 #define TY_STDOUT_FD  1
@@ -316,16 +207,19 @@ static int64_t io_do_read(int fd, char* buf, size_t len) {
 /* ════════════════════════════════════════════════════════════════════════════
  *  Minimal printf formatter
  *  All output is accumulated into a local Buf then flushed in one write.
- * ════════════════════════════════════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════════════════
+ */
 
-/* ── stack Buf (no arena needed for ephemeral output) ───────────────────────── */
+/* ── stack Buf (no arena needed for ephemeral output)
+ * ─────────────────────────
+ */
 
 #define STACK_BUF_CAP 4096
 
 typedef struct {
-    char    data[STACK_BUF_CAP];
-    size_t  len;
-    int     overflow;   /* if 1, data was truncated */
+    char   data[STACK_BUF_CAP];
+    size_t len;
+    int    overflow;   /* if 1, data was truncated */
 } StackBuf;
 
 static void sbuf_init(StackBuf* b) { b->len = 0; b->overflow = 0; }
@@ -341,21 +235,34 @@ static void sbuf_push(StackBuf* b, const char* s, size_t n) {
     b->data[b->len] = '\0';
 }
 
-static void sbuf_push_char(StackBuf* b, char c) { sbuf_push(b, &c, 1); }
+static void sbuf_push_char(StackBuf* b, char c) {
+    sbuf_push(b, &c, 1);
+}
 
 static void sbuf_push_str(StackBuf* b, const char* s) {
     if (!s) s = "(null)";
     sbuf_push(b, s, strlen(s));
 }
 
-/* ── integer → string ───────────────────────────────────────────────────────── */
+/* ── integer → string
+ * ─────────────────────────────────────────────────────────
+ */
 
 static size_t fmt_u64(char* out, uint64_t v, int base, int upper) {
-    if (v == 0) { out[0] = '0'; out[1] = '\0'; return 1; }
+    if (v == 0) {
+        out[0] = '0';
+        out[1] = '\0';
+        return 1;
+    }
     const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    char tmp[66]; int i = 0;
-    while (v) { tmp[i++] = digits[v % (uint64_t)base]; v /= (uint64_t)base; }
-    for (int j = 0; j < i; j++) out[j] = tmp[i - 1 - j];
+    char tmp[66];
+    int i = 0;
+    while (v) {
+        tmp[i++] = digits[v % (uint64_t)base];
+        v /= (uint64_t)base;
+    }
+    for (int j = 0; j < i; j++)
+        out[j] = tmp[i - 1 - j];
     out[i] = '\0';
     return (size_t)i;
 }
@@ -368,7 +275,9 @@ static size_t fmt_i64(char* out, int64_t v, int base) {
     return fmt_u64(out, (uint64_t)v, base, 0);
 }
 
-/* ── double → string (very small grisu-like stub) ───────────────────────────── */
+/* ── double → string (very small grisu-like stub)
+ * ─────────────────────────────
+ */
 
 static size_t fmt_double(char* out, double v, int prec, char spec) {
     /* Use platform snprintf for floating-point — it's not in the hot path. */
@@ -381,17 +290,20 @@ static size_t fmt_double(char* out, double v, int prec, char spec) {
     if (prec > 20) prec = 20;
     if (prec >= 10) { fmt[fi++] = (char)('0' + prec / 10); }
     fmt[fi++] = (char)('0' + prec % 10);
-    fmt[fi++] = spec;   /* 'f', 'e', 'g' */
+    fmt[fi++] = spec; /* 'f', 'e', 'g' */
     fmt[fi++] = '\0';
 
-    /* io_snprintf wraps the standard snprintf / _snprintf — acceptable for float formatting. */
+    /* io_snprintf wraps the standard snprintf / _snprintf — acceptable for
+     * float formatting. */
     int n = io_snprintf(out, 64, fmt, v);
     if (n < 0) n = 0;
     out[n] = '\0';
     return (size_t)n;
 }
 
-/* ── padding helper ─────────────────────────────────────────────────────────── */
+/* ── padding helper
+ * ───────────────────────────────────────────────────────────
+ */
 
 static void sbuf_pad(StackBuf* b, int width, size_t used, int left, char padch) {
     if (width <= 0 || (int)used >= width) return;
@@ -405,7 +317,8 @@ static void sbuf_pad(StackBuf* b, int width, size_t used, int left, char padch) 
 
 /* ════════════════════════════════════════════════════════════════════════════
  *  Core vprintf — writes formatted output into a StackBuf
- * ════════════════════════════════════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════════════════
+ */
 
 static void ty_vformat(StackBuf* out, const char* fmt, va_list ap) {
     const char* p = fmt;
@@ -462,120 +375,153 @@ static void ty_vformat(StackBuf* out, const char* fmt, va_list ap) {
 
         case 'c': {
             char c = (char)va_arg(ap, int);
-            if (!flag_left) sbuf_pad(out, width, 1, 0, ' ');
+            if (!flag_left)
+                sbuf_pad(out, width, 1, 0, ' ');
             sbuf_push_char(out, c);
-            if ( flag_left) sbuf_pad(out, width, 1, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, 1, 1, ' ');
             break;
         }
 
         case 's': {
             const char* s = va_arg(ap, const char*);
-            if (!s) s = "(null)";
+            if (!s)
+                s = "(null)";
             size_t slen = strlen(s);
-            if (prec >= 0 && (size_t)prec < slen) slen = (size_t)prec;
-            if (!flag_left) sbuf_pad(out, width, slen, 0, ' ');
+            if (prec >= 0 && (size_t)prec < slen)
+                slen = (size_t)prec;
+            if (!flag_left)
+                sbuf_pad(out, width, slen, 0, ' ');
             sbuf_push(out, s, slen);
-            if ( flag_left) sbuf_pad(out, width, slen, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, slen, 1, ' ');
             break;
         }
 
-        case 'd': case 'i': {
-            int64_t v = is_llong ? va_arg(ap, long long)
-                      : is_long  ? va_arg(ap, long)
-                                 : (int64_t)va_arg(ap, int);
-            size_t n  = fmt_i64(tmp, v, 10);
+        case 'd':
+        case 'i': {
+            int64_t v = is_llong ? va_arg(ap, long long) : is_long ? va_arg(ap, long)
+                                                                   : (int64_t)va_arg(ap, int);
+            size_t n = fmt_i64(tmp, v, 10);
             /* handle sign prefix */
-            char   sign_ch = 0;
+            char sign_ch = 0;
             if (v >= 0) {
-                if (flag_plus)  sign_ch = '+';
-                else if (flag_space) sign_ch = ' ';
+                if (flag_plus)
+                    sign_ch = '+';
+                else if (flag_space)
+                    sign_ch = ' ';
             }
             size_t total = n + (sign_ch ? 1 : 0);
-            char   padch = (flag_zero && !flag_left) ? '0' : ' ';
+            char padch = (flag_zero && !flag_left) ? '0' : ' ';
             if (!flag_left) {
-                if (flag_zero && sign_ch) sbuf_push_char(out, sign_ch);
+                if (flag_zero && sign_ch)
+                    sbuf_push_char(out, sign_ch);
                 sbuf_pad(out, width, total, 0, padch);
-                if (!flag_zero && sign_ch) sbuf_push_char(out, sign_ch);
+                if (!flag_zero && sign_ch)
+                    sbuf_push_char(out, sign_ch);
             } else {
-                if (sign_ch) sbuf_push_char(out, sign_ch);
+                if (sign_ch)
+                    sbuf_push_char(out, sign_ch);
             }
             sbuf_push(out, tmp + (v < 0 ? 1 : 0), n - (v < 0 ? 1 : 0));
-            if (v < 0) { /* already in tmp[0] if negative */ }
+            if (v < 0) { /* already in tmp[0] if negative */
+            }
             /* redo cleanly */
             out->len -= n - (v < 0 ? 1 : 0);
-            if (v < 0) { sbuf_push_char(out, '-'); }
-            else if (sign_ch && !(!flag_left && !flag_zero)) { /* already pushed */ }
+            if (v < 0) {
+                sbuf_push_char(out, '-');
+            } else if (sign_ch && !(!flag_left && !flag_zero)) { /* already pushed */
+            }
             sbuf_push(out, tmp + (v < 0 ? 1 : 0), n - (v < 0 ? 1 : 0));
-            if (flag_left) sbuf_pad(out, width, total, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, total, 1, ' ');
             break;
         }
 
         case 'u': {
             uint64_t v = is_llong ? (uint64_t)va_arg(ap, unsigned long long)
-                       : is_long  ? (uint64_t)va_arg(ap, unsigned long)
+                : is_long         ? (uint64_t)va_arg(ap, unsigned long)
                                   : (uint64_t)va_arg(ap, unsigned int);
-            size_t n   = fmt_u64(tmp, v, 10, 0);
-            char   padch = (flag_zero && !flag_left) ? '0' : ' ';
-            if (!flag_left) sbuf_pad(out, width, n, 0, padch);
+            size_t n = fmt_u64(tmp, v, 10, 0);
+            char padch = (flag_zero && !flag_left) ? '0' : ' ';
+            if (!flag_left)
+                sbuf_pad(out, width, n, 0, padch);
             sbuf_push(out, tmp, n);
-            if ( flag_left) sbuf_pad(out, width, n, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, n, 1, ' ');
             break;
         }
 
-        case 'x': case 'X': {
+        case 'x':
+        case 'X': {
             uint64_t v = is_llong ? (uint64_t)va_arg(ap, unsigned long long)
-                       : is_long  ? (uint64_t)va_arg(ap, unsigned long)
+                : is_long         ? (uint64_t)va_arg(ap, unsigned long)
                                   : (uint64_t)va_arg(ap, unsigned int);
             size_t pfx = (flag_hash && v) ? 2 : 0;
-            size_t n   = fmt_u64(tmp, v, 16, spec == 'X');
+            size_t n = fmt_u64(tmp, v, 16, spec == 'X');
             size_t total = n + pfx;
-            char   padch = (flag_zero && !flag_left) ? '0' : ' ';
+            char padch = (flag_zero && !flag_left) ? '0' : ' ';
             if (!flag_left) {
                 if (flag_zero && pfx) {
                     sbuf_push(out, spec == 'X' ? "0X" : "0x", 2);
                 }
                 sbuf_pad(out, width, total, 0, padch);
-                if (!flag_zero && pfx) sbuf_push(out, spec == 'X' ? "0X" : "0x", 2);
+                if (!flag_zero && pfx)
+                    sbuf_push(out, spec == 'X' ? "0X" : "0x", 2);
             } else {
-                if (pfx) sbuf_push(out, spec == 'X' ? "0X" : "0x", 2);
+                if (pfx)
+                    sbuf_push(out, spec == 'X' ? "0X" : "0x", 2);
             }
             sbuf_push(out, tmp, n);
-            if (flag_left) sbuf_pad(out, width, total, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, total, 1, ' ');
             break;
         }
 
         case 'o': {
             uint64_t v = is_llong ? (uint64_t)va_arg(ap, unsigned long long)
-                       : is_long  ? (uint64_t)va_arg(ap, unsigned long)
+                : is_long         ? (uint64_t)va_arg(ap, unsigned long)
                                   : (uint64_t)va_arg(ap, unsigned int);
-            if (flag_hash && v) sbuf_push_char(out, '0');
+            if (flag_hash && v)
+                sbuf_push_char(out, '0');
             size_t n = fmt_u64(tmp, v, 8, 0);
-            char   padch = (flag_zero && !flag_left) ? '0' : ' ';
-            if (!flag_left) sbuf_pad(out, width, n, 0, padch);
+            char padch = (flag_zero && !flag_left) ? '0' : ' ';
+            if (!flag_left)
+                sbuf_pad(out, width, n, 0, padch);
             sbuf_push(out, tmp, n);
-            if ( flag_left) sbuf_pad(out, width, n, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, n, 1, ' ');
             break;
         }
 
         case 'b': {
             /* %b — binary (extension) */
             uint64_t v = is_llong ? (uint64_t)va_arg(ap, unsigned long long)
-                       : is_long  ? (uint64_t)va_arg(ap, unsigned long)
+                : is_long         ? (uint64_t)va_arg(ap, unsigned long)
                                   : (uint64_t)va_arg(ap, unsigned int);
             size_t n = fmt_u64(tmp, v, 2, 0);
-            char   padch = (flag_zero && !flag_left) ? '0' : ' ';
-            if (!flag_left) sbuf_pad(out, width, n, 0, padch);
+            char padch = (flag_zero && !flag_left) ? '0' : ' ';
+            if (!flag_left)
+                sbuf_pad(out, width, n, 0, padch);
             sbuf_push(out, tmp, n);
-            if ( flag_left) sbuf_pad(out, width, n, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, n, 1, ' ');
             break;
         }
 
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G': {
             double v = va_arg(ap, double);
             size_t n = fmt_double(tmp, v, prec, (char)(spec | 0x20)); /* lowercase */
-            if (!flag_left) sbuf_pad(out, width, n, 0, flag_zero ? '0' : ' ');
+            if (!flag_left)
+                sbuf_pad(out, width, n, 0, flag_zero ? '0' : ' ');
             sbuf_push(out, tmp, n);
-            if ( flag_left) sbuf_pad(out, width, n, 1, ' ');
+            if (flag_left)
+                sbuf_pad(out, width, n, 1, ' ');
             break;
         }
 
@@ -589,83 +535,147 @@ static void ty_vformat(StackBuf* out, const char* fmt, va_list ap) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  PRINT family  — write to fd
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
-/* ── ty_print / ty_println ───────────────────────────────────────────────────── */
+/* ── ty_print / ty_println
+ * ───────────────────────────────────────────────────── */
 
-void ty_print(void* task, char* s) {
+void ty_print(SlabArena* arena, char* s) {
     if (!s) s = "";
-    (void)task;
+    (void)arena;
     io_do_write(TY_STDOUT_FD, s, strlen(s));
 }
 
-void ty_println(void* task, char* s) {
-    ty_print(task, s);
+void ty_println(SlabArena* arena, char* s) {
+    ty_print(arena, s);
     io_do_write(TY_STDOUT_FD, "\n", 1);
 }
 
-/* ── ty_printf ───────────────────────────────────────────────────────────────── */
+/* ── ty_printf
+ * ───────────────────────────────────────────────────────────────── */
 
-void ty_printf(void* task, char* fmt, ...) {
-    (void)task;
-    StackBuf buf; sbuf_init(&buf);
-    va_list ap; va_start(ap, fmt);
-    ty_vformat(&buf, fmt, ap);
-    va_end(ap);
+static void ty_format_fixed(StackBuf* out, const char* fmt, uint64_t* args, int n_args) {
+    const char* p = fmt;
+    int arg_idx = 0;
+    while (*p) {
+        if (*p != '%') {
+            sbuf_push_char(out, *p++);
+            continue;
+        }
+        p++; /* skip '%' */
+        if (*p == '%') {
+            sbuf_push_char(out, '%');
+            p++;
+            continue;
+        }
+
+        /* Skip flags/width for now or handle simply */
+        while (*p && strchr("-+ #0123456789.", *p))
+            p++;
+
+        int is_long = 0;
+        if (*p == 'l') {
+            is_long = 1;
+            p++;
+            if (*p == 'l') p++;
+        }
+
+        char spec = *p++;
+        char tmp[72];
+        uint64_t val = (arg_idx < n_args) ? args[arg_idx++] : 0;
+
+        if (spec == 'd' || spec == 'i') {
+            fmt_i64(tmp, (int64_t)val, 10);
+            sbuf_push(out, tmp, strlen(tmp));
+        } else if (spec == 'u') {
+            fmt_u64(tmp, val, 10, 0);
+            sbuf_push(out, tmp, strlen(tmp));
+        } else if (spec == 'x' || spec == 'X') {
+            fmt_u64(tmp, val, 16, spec == 'X');
+            sbuf_push(out, tmp, strlen(tmp));
+        } else if (spec == 's') {
+            const char* s = (const char*)val;
+            if (!s) s = "(null)";
+            sbuf_push(out, s, strlen(s));
+        } else if (spec == 'c') {
+            sbuf_push_char(out, (char)val);
+        } else if (spec == 'p') {
+            sbuf_push(out, "0x", 2);
+            fmt_u64(tmp, val, 16, 0);
+            sbuf_push(out, tmp, strlen(tmp));
+        }
+    }
+}
+
+void ty_printf(SlabArena* arena, char* fmt, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    (void)arena;
+    StackBuf buf;
+    sbuf_init(&buf);
+    uint64_t args[4] = { a1, a2, a3, a4 };
+    ty_format_fixed(&buf, fmt, args, 4);
     io_do_write(TY_STDOUT_FD, buf.data, buf.len);
 }
 
-/* ── ty_fprint / ty_fprintln / ty_fprintf ────────────────────────────────────── */
+/* ── ty_fprint / ty_fprintln / ty_fprintf
+ * ────────────────────────────────────── */
 
-void ty_fprint(void* task, int fd, char* s) {
-    (void)task;
+void ty_fprint(SlabArena* arena, int fd, char* s) {
+    (void)arena;
     if (!s) s = "";
     io_do_write(fd, s, strlen(s));
 }
 
-void ty_fprintln(void* task, int fd, char* s) {
-    ty_fprint(task, fd, s);
+void ty_fprintln(SlabArena* arena, int fd, char* s) {
+    ty_fprint(arena, fd, s);
     io_do_write(fd, "\n", 1);
 }
 
-void ty_fprintf(void* task, int fd, char* fmt, ...) {
-    (void)task;
-    StackBuf buf; sbuf_init(&buf);
-    va_list ap; va_start(ap, fmt);
+void ty_fprintf(SlabArena* arena, int fd, char* fmt, ...) {
+    (void)arena;
+    StackBuf buf;
+    sbuf_init(&buf);
+    va_list ap;
+    va_start(ap, fmt);
     ty_vformat(&buf, fmt, ap);
     va_end(ap);
     io_do_write(fd, buf.data, buf.len);
 }
 
-/* ── ty_sprint / ty_sprintln / ty_sprintf — write into a Buf ────────────────── */
+/* ── ty_sprint / ty_sprintln / ty_sprintf — write into a Buf
+ * ──────────────────
+ */
 
 /*
  * The `out` parameter is a Buf* allocated in the caller's arena (task).
  * We push the formatted text into it using ty_buf_push_str.
  */
 
-void ty_sprint(void* task, struct Buf* out, char* s) {
+void ty_sprint(SlabArena* arena, Buf* out, char* s) {
     if (!out || !s) return;
-    ty_buf_push_str((struct SlabArena*)task, out, s);
+    ty_buf_push_str(arena, out, s);
 }
 
-void ty_sprintln(void* task, struct Buf* out, char* s) {
-    ty_sprint(task, out, s);
-    ty_buf_push_str((struct SlabArena*)task, out, "\n");
+void ty_sprintln(SlabArena* arena, Buf* out, char* s) {
+    ty_sprint(arena, out, s);
+    ty_buf_push_str(arena, out, "\n");
 }
 
-void ty_sprintf(void* task, struct Buf* out, char* fmt, ...) {
+void ty_sprintf(SlabArena* arena, Buf* out, char* fmt, ...) {
     if (!out) return;
-    StackBuf tmp; sbuf_init(&tmp);
-    va_list ap; va_start(ap, fmt);
+    StackBuf tmp;
+    sbuf_init(&tmp);
+    va_list ap;
+    va_start(ap, fmt);
     ty_vformat(&tmp, fmt, ap);
     va_end(ap);
-    ty_buf_push_str((struct SlabArena*)task, out, tmp.data);
+    ty_buf_push_str(arena, out, tmp.data);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  SCAN family  — read tokens / formatted data
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Token reading strategy
@@ -679,7 +689,8 @@ void ty_sprintf(void* task, struct Buf* out, char* fmt, ...) {
  *     %s %c %d %i %u %ld %li %lu %lld %lli %llu %f %lf %g %e %x %X %o
  */
 
-/* ── skip whitespace ─────────────────────────────────────────────────────────── */
+/* ── skip whitespace
+ * ─────────────────────────────────────────────────────────── */
 
 static int read_char(int fd) {
     char c = 0;
@@ -696,7 +707,8 @@ static int skip_ws(int fd) {
     return -1;
 }
 
-/* ── read one whitespace-delimited token ──────────────────────────────────────── */
+/* ── read one whitespace-delimited token
+ * ──────────────────────────────────────── */
 
 static int read_token(int fd, char* buf, size_t cap) {
     int c = skip_ws(fd);
@@ -710,31 +722,33 @@ static int read_token(int fd, char* buf, size_t cap) {
     return (int)i;
 }
 
-/* ── ty_scan / ty_fscan ──────────────────────────────────────────────────────── */
+/* ── ty_scan / ty_fscan
+ * ──────────────────────────────────────────────────────── */
 
 /*
  * Returns a new Str (char*) in the calling coroutine's arena.
  * The string persists until slab_arena_free.
  */
-char* ty_scan(void* task) {
+char* ty_scan(SlabArena* arena) {
     char tmp[1024];
     int n = read_token(TY_STDIN_FD, tmp, sizeof(tmp));
     if (n == 0) return NULL;
-    struct Buf* b = ty_buf_new((struct SlabArena*)task);
-    ty_buf_push_str((struct SlabArena*)task, b, tmp);
-    return ty_buf_into_str((struct SlabArena*)task, b);
+    Buf* b = ty_buf_new(arena);
+    ty_buf_push_str(arena, b, tmp);
+    return ty_buf_into_str(arena, b);
 }
 
-char* ty_fscan(void* task, int fd) {
+char* ty_fscan(SlabArena* arena, int fd) {
     char tmp[1024];
     int n = read_token(fd, tmp, sizeof(tmp));
     if (n == 0) return NULL;
-    struct Buf* b = ty_buf_new((struct SlabArena*)task);
-    ty_buf_push_str((struct SlabArena*)task, b, tmp);
-    return ty_buf_into_str((struct SlabArena*)task, b);
+    Buf* b = ty_buf_new(arena);
+    ty_buf_push_str(arena, b, tmp);
+    return ty_buf_into_str(arena, b);
 }
 
-/* ── Core vscanf ─────────────────────────────────────────────────────────────── */
+/* ── Core vscanf
+ * ─────────────────────────────────────────────────────────────── */
 
 /*
  * ty_vfscanf — reads from fd according to fmt, filling va_list pointers.
@@ -784,7 +798,6 @@ static int ty_vfscanf(int fd, const char* fmt, va_list ap) {
         char spec = *p++;
 
         switch (spec) {
-
         case 's': {
             char tok[1024]; int n = read_token(fd, tok, sizeof(tok));
             if (n == 0) return matched;
@@ -799,68 +812,114 @@ static int ty_vfscanf(int fd, const char* fmt, va_list ap) {
             break;
         }
 
-        case 'd': case 'i': {
-            char tok[32]; int n = read_token(fd, tok, sizeof(tok));
-            if (n == 0) return matched;
-            int64_t v = 0; int neg = 0; const char* q = tok;
-            if (*q == '-') { neg = 1; q++; } else if (*q == '+') q++;
-            while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-            if (neg) v = -v;
+        case 'd':
+        case 'i': {
+            char tok[32];
+            int n = read_token(fd, tok, sizeof(tok));
+            if (n == 0)
+                return matched;
+            int64_t v = 0;
+            int neg = 0;
+            const char* q = tok;
+            if (*q == '-') {
+                neg = 1;
+                q++;
+            } else if (*q == '+')
+                q++;
+            while (*q >= '0' && *q <= '9')
+                v = v * 10 + (*q++ - '0');
+            if (neg)
+                v = -v;
             if (!suppress) {
-                if (is_llong) *va_arg(ap, long long*)      = (long long)v;
-                else if (is_long) *va_arg(ap, long*)        = (long)v;
-                else              *va_arg(ap, int*)          = (int)v;
+                if (is_llong)
+                    *va_arg(ap, long long*) = (long long)v;
+                else if (is_long)
+                    *va_arg(ap, long*) = (long)v;
+                else
+                    *va_arg(ap, int*) = (int)v;
                 matched++;
             }
             break;
         }
 
         case 'u': {
-            char tok[32]; int n = read_token(fd, tok, sizeof(tok));
-            if (n == 0) return matched;
-            uint64_t v = 0; const char* q = tok;
-            while (*q >= '0' && *q <= '9') v = v * 10 + (uint64_t)(*q++ - '0');
+            char tok[32];
+            int n = read_token(fd, tok, sizeof(tok));
+            if (n == 0)
+                return matched;
+            uint64_t v = 0;
+            const char* q = tok;
+            while (*q >= '0' && *q <= '9')
+                v = v * 10 + (uint64_t)(*q++ - '0');
             if (!suppress) {
-                if (is_llong) *va_arg(ap, unsigned long long*) = (unsigned long long)v;
-                else if (is_long) *va_arg(ap, unsigned long*)  = (unsigned long)v;
-                else              *va_arg(ap, unsigned int*)   = (unsigned int)v;
+                if (is_llong)
+                    *va_arg(ap, unsigned long long*) = (unsigned long long)v;
+                else if (is_long)
+                    *va_arg(ap, unsigned long*) = (unsigned long)v;
+                else
+                    *va_arg(ap, unsigned int*) = (unsigned int)v;
                 matched++;
             }
             break;
         }
 
-        case 'x': case 'X': {
-            char tok[32]; int n = read_token(fd, tok, sizeof(tok));
-            if (n == 0) return matched;
-            uint64_t v = 0; const char* q = tok;
-            if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2;
+        case 'x':
+        case 'X': {
+            char tok[32];
+            int n = read_token(fd, tok, sizeof(tok));
+            if (n == 0)
+                return matched;
+            uint64_t v = 0;
+            const char* q = tok;
+            if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X'))
+                q += 2;
             while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') || (*q >= 'A' && *q <= 'F')) {
                 uint64_t d = (*q >= 'a') ? (uint64_t)(*q - 'a' + 10)
-                           : (*q >= 'A') ? (uint64_t)(*q - 'A' + 10)
+                    : (*q >= 'A')        ? (uint64_t)(*q - 'A' + 10)
                                          : (uint64_t)(*q - '0');
-                v = v * 16 + d; q++;
+                v = v * 16 + d;
+                q++;
             }
-            if (!suppress) { *va_arg(ap, unsigned int*) = (unsigned int)v; matched++; }
+            if (!suppress) {
+                *va_arg(ap, unsigned int*) = (unsigned int)v;
+                matched++;
+            }
             break;
         }
 
         case 'o': {
-            char tok[32]; int n = read_token(fd, tok, sizeof(tok));
-            if (n == 0) return matched;
-            uint64_t v = 0; const char* q = tok;
-            while (*q >= '0' && *q <= '7') v = v * 8 + (uint64_t)(*q++ - '0');
-            if (!suppress) { *va_arg(ap, unsigned int*) = (unsigned int)v; matched++; }
+            char tok[32];
+            int n = read_token(fd, tok, sizeof(tok));
+            if (n == 0)
+                return matched;
+            uint64_t v = 0;
+            const char* q = tok;
+            while (*q >= '0' && *q <= '7')
+                v = v * 8 + (uint64_t)(*q++ - '0');
+            if (!suppress) {
+                *va_arg(ap, unsigned int*) = (unsigned int)v;
+                matched++;
+            }
             break;
         }
 
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
-            char tok[64]; int n = read_token(fd, tok, sizeof(tok));
-            if (n == 0) return matched;
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G': {
+            char tok[64];
+            int n = read_token(fd, tok, sizeof(tok));
+            if (n == 0)
+                return matched;
             /* Use platform strtod */
             double v = io_strtod(tok, NULL);
             if (!suppress) {
-                if (is_long) *va_arg(ap, double*) = v;
-                else         *va_arg(ap, float*)  = (float)v;
+                if (is_long)
+                    *va_arg(ap, double*) = v;
+                else
+                    *va_arg(ap, float*) = (float)v;
                 matched++;
             }
             break;
@@ -873,11 +932,13 @@ static int ty_vfscanf(int fd, const char* fmt, va_list ap) {
     return matched;
 }
 
-/* ── ty_scanf / ty_fscanf ────────────────────────────────────────────────────── */
+/* ── ty_scanf / ty_fscanf
+ * ────────────────────────────────────────────────────── */
 
 int ty_scanf(void* task, char* fmt, ...) {
     (void)task;
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int n = ty_vfscanf(TY_STDIN_FD, fmt, ap);
     va_end(ap);
     return n;
@@ -885,13 +946,16 @@ int ty_scanf(void* task, char* fmt, ...) {
 
 int ty_fscanf(void* task, int fd, char* fmt, ...) {
     (void)task;
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int n = ty_vfscanf(fd, fmt, ap);
     va_end(ap);
     return n;
 }
 
-/* ── ty_sscan / ty_sscanf — read from a Str (char*) ─────────────────────────── */
+/* ── ty_sscan / ty_sscanf — read from a Str (char*)
+ * ───────────────────────────
+ */
 
 /*
  * sscan / sscanf are purely in-memory; no async I/O needed.
@@ -939,13 +1003,24 @@ static int sc_read_token(StrCursor* sc, char* buf, size_t cap) {
  */
 char* ty_sscan(void* task, char* src, char** rest_out) {
     (void)task;
-    if (!src) { if (rest_out) *rest_out = NULL; return NULL; }
+    if (!src) {
+        if (rest_out) *rest_out = NULL;
+        return NULL;
+    }
     /* skip leading whitespace */
-    while (*src == ' ' || *src == '\t' || *src == '\n' || *src == '\r') src++;
-    if (!*src) { if (rest_out) *rest_out = src; return NULL; }
+    while (*src == ' ' || *src == '\t' || *src == '\n' || *src == '\r')
+        src++;
+    if (!*src) {
+        if (rest_out) *rest_out = src;
+        return NULL;
+    }
     char* start = src;
-    while (*src && *src != ' ' && *src != '\t' && *src != '\n' && *src != '\r') src++;
-    if (*src) { *src = '\0'; src++; }
+    while (*src && *src != ' ' && *src != '\t' && *src != '\n' && *src != '\r')
+        src++;
+    if (*src) {
+        *src = '\0';
+        src++;
+    }
     if (rest_out) *rest_out = src;
     return start;
 }
@@ -959,69 +1034,121 @@ static int ty_vsscanf(const char* src, const char* fmt, va_list ap) {
     const char* p = fmt;
 
     while (*p) {
-        if (*p == ' ' || *p == '\t' || *p == '\n') { p++; continue; }
+        if (*p == ' ' || *p == '\t' || *p == '\n') {
+            p++;
+            continue;
+        }
         if (*p != '%') {
             int c = sc_read_char(&sc);
             if (c != (unsigned char)*p) return matched;
-            p++; continue;
+            p++;
+            continue;
         }
         p++;
-        if (*p == '%') { sc_read_char(&sc); p++; continue; }
+        if (*p == '%') {
+            sc_read_char(&sc);
+            p++;
+            continue;
+        }
 
         int suppress = 0;
-        if (*p == '*') { suppress = 1; p++; }
+        if (*p == '*') {
+            suppress = 1;
+            p++;
+        }
         int width = 0;
-        while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0');
+        while (*p >= '0' && *p <= '9')
+            width = width * 10 + (*p++ - '0');
         int is_long = 0, is_llong = 0;
-        if (*p == 'l') { p++; if (*p == 'l') { is_llong = 1; p++; } else is_long = 1; }
-        else if (*p == 'h') p++;
+        if (*p == 'l') {
+            p++;
+            if (*p == 'l') {
+                is_llong = 1;
+                p++;
+            } else
+                is_long = 1;
+        } else if (*p == 'h')
+            p++;
         char spec = *p++;
 
         switch (spec) {
         case 's': {
-            char tok[1024]; int n = sc_read_token(&sc, tok, sizeof(tok));
+            char tok[1024];
+            int n = sc_read_token(&sc, tok, sizeof(tok));
             if (n == 0) return matched;
-            if (!suppress) { char** dst = va_arg(ap, char**); *dst = tok; matched++; }
+            if (!suppress) {
+                char** dst = va_arg(ap, char**);
+                *dst = tok;
+                matched++;
+            }
             break;
         }
         case 'c': {
             int c = sc_read_char(&sc);
             if (c < 0) return matched;
-            if (!suppress) { *va_arg(ap, char*) = (char)c; matched++; }
+            if (!suppress) {
+                *va_arg(ap, char*) = (char)c;
+                matched++;
+            }
             break;
         }
-        case 'd': case 'i': {
-            char tok[32]; sc_read_token(&sc, tok, sizeof(tok));
-            int64_t v = 0; int neg = 0; const char* q = tok;
-            if (*q == '-') { neg = 1; q++; } else if (*q == '+') q++;
-            while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-            if (neg) v = -v;
+        case 'd':
+        case 'i': {
+            char tok[32];
+            sc_read_token(&sc, tok, sizeof(tok));
+            int64_t v = 0;
+            int neg = 0;
+            const char* q = tok;
+            if (*q == '-') {
+                neg = 1;
+                q++;
+            } else if (*q == '+')
+                q++;
+            while (*q >= '0' && *q <= '9')
+                v = v * 10 + (*q++ - '0');
+            if (neg)
+                v = -v;
             if (!suppress) {
-                if (is_llong) *va_arg(ap, long long*)  = (long long)v;
-                else if (is_long) *va_arg(ap, long*)   = (long)v;
-                else              *va_arg(ap, int*)    = (int)v;
+                if (is_llong)
+                    *va_arg(ap, long long*) = (long long)v;
+                else if (is_long)
+                    *va_arg(ap, long*) = (long)v;
+                else
+                    *va_arg(ap, int*) = (int)v;
                 matched++;
             }
             break;
         }
         case 'u': {
-            char tok[32]; sc_read_token(&sc, tok, sizeof(tok));
-            uint64_t v = 0; const char* q = tok;
-            while (*q >= '0' && *q <= '9') v = v * 10 + (uint64_t)(*q++ - '0');
-            if (!suppress) { *va_arg(ap, unsigned int*) = (unsigned int)v; matched++; }
-            break;
-        }
-        case 'f': case 'g': case 'e': {
-            char tok[64]; sc_read_token(&sc, tok, sizeof(tok));
-            double v = io_strtod(tok, NULL);
+            char tok[32];
+            sc_read_token(&sc, tok, sizeof(tok));
+            uint64_t v = 0;
+            const char* q = tok;
+            while (*q >= '0' && *q <= '9')
+                v = v * 10 + (uint64_t)(*q++ - '0');
             if (!suppress) {
-                if (is_long || is_llong) *va_arg(ap, double*) = v;
-                else                     *va_arg(ap, float*)  = (float)v;
+                *va_arg(ap, unsigned int*) = (unsigned int)v;
                 matched++;
             }
             break;
         }
-        default: return matched;
+        case 'f':
+        case 'g':
+        case 'e': {
+            char tok[64];
+            sc_read_token(&sc, tok, sizeof(tok));
+            double v = io_strtod(tok, NULL);
+            if (!suppress) {
+                if (is_long || is_llong)
+                    *va_arg(ap, double*) = v;
+                else
+                    *va_arg(ap, float*) = (float)v;
+                matched++;
+            }
+            break;
+        }
+        default:
+            return matched;
         }
     }
     return matched;
@@ -1029,7 +1156,8 @@ static int ty_vsscanf(const char* src, const char* fmt, va_list ap) {
 
 int ty_sscanf(void* task, char* src, char* fmt, ...) {
     (void)task;
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int n = ty_vsscanf(src, fmt, ap);
     va_end(ap);
     return n;
@@ -1056,4 +1184,5 @@ declare i32     @ty_fscanf   (i8* %task, i32 %fd, i8* %fmt, ...)
 declare i8*     @ty_sscan    (i8* %task, i8* %src, i8** %rest_out)
 declare i32     @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)
 
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+*/

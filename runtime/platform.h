@@ -99,6 +99,7 @@ typedef struct {
 } TyCtx;
 
 /* Implemented in ty_ctx.S — one translation unit only. */
+__attribute__((no_sanitize("address")))
 extern void ty_ctx_swap(TyCtx* from, TyCtx* to);
 extern void ty__coro_entry(void);
 
@@ -109,6 +110,8 @@ static inline void ty_ctx_init(TyCtx* ctx, void* stack_bottom, size_t stack_size
     uint64_t* stack_top = (uint64_t*)((char*)stack_bottom + stack_size);
 
     // Push arguments in the order ty__coro_entry will pop them
+    *(--stack_top) = 0;                // alignment padding (pushed first = highest addr)
+                                       // makes rsp 16-byte aligned at the jmpq into ty__coro_entry
     *(--stack_top) = (uint64_t)lo;     // [rsp+16]
     *(--stack_top) = (uint64_t)hi;     // [rsp+8]
     *(--stack_top) = (uint64_t)tramp;  // [rsp+0]
@@ -121,26 +124,40 @@ static inline void ty_ctx_init(TyCtx* ctx, void* stack_bottom, size_t stack_size
 #elif defined(__aarch64__)
 
 typedef struct {
-    uint64_t regs[14];
-    /* x19,x20,x21,x22,x23,x24,x25,x26,x27,x28,x29,x30(lr),sp,pad */
+    uint64_t regs[22];
+    /* x19,x20,x21,x22,x23,x24,x25,x26,x27,x28,x29,x30(lr),sp,pad,d8-d15 */
 } TyCtx;
 
 /* Implemented in ty_ctx.S — one translation unit only. */
+__attribute__((no_sanitize("address")))
 extern void ty_ctx_swap(TyCtx* from, TyCtx* to);
 extern void ty__coro_entry(void);
 
 static inline void ty_ctx_init(TyCtx* ctx, void* stack_bottom, size_t stack_size,
                  void (*tramp)(uint32_t, uint32_t),
                  uint32_t hi, uint32_t lo) {
-    memset(ctx, 0, sizeof(*ctx));
+    // Force 16-byte alignment downward
+    uintptr_t stack_top = (uintptr_t)stack_bottom + stack_size;
+    stack_top &= ~0xFULL;
 
-    // x19, x20, x21 are used by ty__coro_entry
-    ctx->regs[0]  = (uint64_t)tramp;           // x19
-    ctx->regs[1]  = (uint64_t)hi;              // x20
-    ctx->regs[2]  = (uint64_t)lo;              // x21
-    ctx->regs[11] = (uint64_t)ty__coro_entry;  // x30 (Link Register)
-    ctx->regs[12] = (uint64_t)stack_bottom + stack_size; // sp
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->regs[0]  = (uint64_t)tramp;
+    ctx->regs[1]  = (uint64_t)hi;
+    ctx->regs[2]  = (uint64_t)lo;
+    ctx->regs[11] = (uint64_t)ty__coro_entry;
+    ctx->regs[12] = (uint64_t)stack_top; // sp
 }
+
+// static inline void ty_ctx_init(TyCtx* ctx, void* stack_bottom, size_t stack_size,
+//     memset(ctx, 0, sizeof(*ctx));
+
+//     // x19, x20, x21 are used by ty__coro_entry
+//     ctx->regs[0]  = (uint64_t)tramp;           // x19
+//     ctx->regs[1]  = (uint64_t)hi;              // x20
+//     ctx->regs[2]  = (uint64_t)lo;              // x21
+//     ctx->regs[11] = (uint64_t)ty__coro_entry;  // x30 (Link Register)
+//     ctx->regs[12] = (uint64_t)stack_bottom + stack_size; // sp
+// }
 
 #endif
 

@@ -71,20 +71,54 @@ impl Codegen {
                         .as_ref()
                         .map(|ty| b.lower_type(ty))
                         .unwrap_or_else(|| "void".to_string());
-                    let body_ir = b.emit_function(name, params, &ret_ty, body);
-                    let mut param_list: Vec<(String, String)> = params
-                        .iter()
-                        .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation)))
-                        .collect();
-                    if !is_main(&name.name) {
+
+                    if is_main(&name.name) {
+                        // ── Emit user's main body as a coroutine ──────────────
+                        // The body runs inside a spawned coroutine so that
+                        // ty_chan_recv/send can park properly (me != NULL).
+                        // We give it the internal name __ty_main_body and treat
+                        // it like any other non-main function (task param, no
+                        // sched_init, no sched_shutdown inside).
+                        let body_ir = b.emit_main_body(params, body);
+                        let body_fn = IrFunction {
+                            name: "__ty_main_body".to_string(),
+                            body: body_ir,
+                            ret_type: "void".to_string(),
+                            params: vec![
+                                ("task".to_string(), "i8*".to_string()),
+                                ("arg".to_string(),  "i8*".to_string()),
+                            ],
+                        };
+
+                        // ── Emit thin bootstrap main() ────────────────────────
+                        // Initialises the scheduler, spawns __ty_main_body, then
+                        // drives it to completion via ty_sched_shutdown.
+                        let bootstrap = IrFunction {
+                            name: "main".to_string(),
+                            body: b.emit_bootstrap_main(),
+                            ret_type: "i32".to_string(),
+                            params: vec![],
+                        };
+
+                        // We return both; collect() flattens via extend below.
+                        // Use a small trick: push body_fn into conc_functions so
+                        // we can return only one Option here, then push bootstrap.
+                        b.conc_functions.push(body_fn);
+                        Some(bootstrap)
+                    } else {
+                        let body_ir = b.emit_function(name, params, &ret_ty, body);
+                        let mut param_list: Vec<(String, String)> = params
+                            .iter()
+                            .map(|p| (p.name.name.clone(), b.lower_type(&p.type_annotation)))
+                            .collect();
                         param_list.insert(0, ("task".to_string(), "i8*".to_string()));
+                        Some(IrFunction {
+                            name: name.name.clone(),
+                            body: body_ir,
+                            ret_type: ret_ty,
+                            params: param_list,
+                        })
                     }
-                    Some(IrFunction {
-                        name: link_symbol_name(&name.name),
-                        body: body_ir,
-                        ret_type: ret_ty,
-                        params: param_list,
-                    })
                 } else {
                     None
                 }
@@ -333,9 +367,8 @@ impl<'a> IrBuilder<'a> {
                         .iter()
                         .map(|p| self.lower_type(&p.type_annotation))
                         .collect();
-                    if !is_main(&name.name) {
-                        param_types.insert(0, "i8*".to_string());
-                    }
+                    // Every function (including main, now __ty_main_body) takes task.
+                    param_types.insert(0, "i8*".to_string());
                     self.func_sigs
                         .insert(name.name.clone(), (ret_ty, param_types));
                 }
@@ -370,17 +403,8 @@ impl<'a> IrBuilder<'a> {
         self.current_fn_ret_ty = ret_ty.to_string();
         self.current_fn_name = Some(name.name.clone());
         self.emit("entry:".to_string());
-        if is_main(&name.name) {
-            let task_slot = self.tmp();
-            self.emit(format!("  {} = alloca i8*", task_slot));
-            self.emit("  %task_init = call i8* @slab_arena_new()".to_string());
-            self.emit(format!("  store i8* %task_init, i8** {}", task_slot));
-            self.emit("  call void @ty_sched_init()".to_string());
-            self.emit("  call void @ty_io_subsystem_init()".to_string());
-            self.emit(format!("  %task = load i8*, i8** {}", task_slot));
-        } else {
-            self.emit_function_param("task".to_string(), "i8*".to_string());
-        }
+        // All functions (including former-main, now __ty_main_body) get a task param.
+        self.emit_function_param("task".to_string(), "i8*".to_string());
         for param in params {
             let ty = self.lower_type(&param.type_annotation);
             self.emit_function_param(param.name.name.clone(), ty);
@@ -424,6 +448,69 @@ impl<'a> IrBuilder<'a> {
         self.lines.join("\n")
     }
 
+    // ── Bootstrap helpers ─────────────────────────────────────────────────────
+
+    /// Emit the user's `main` body as a void coroutine named `__ty_main_body`.
+    /// It receives `(task: i8*, arg: i8*)` like every other spawned trampoline,
+    /// ignores `arg`, and returns void.  Scheduler init/shutdown are NOT emitted
+    /// here — the thin bootstrap `main()` owns those.
+    fn emit_main_body(&mut self, params: &[Parameter], body: &Block) -> String {
+        self.lines.clear();
+        self.locals.clear();
+        self.locals_type.clear();
+        self.next_tmp = 0;
+        self.current_fn_ret_ty = "void".to_string();
+        self.current_fn_name = Some("__ty_main_body".to_string());
+
+        self.emit("entry:".to_string());
+        // Bind task and arg params (arg is unused but must be accepted).
+        self.emit_function_param("task".to_string(), "i8*".to_string());
+        self.emit_function_param("arg".to_string(),  "i8*".to_string());
+
+        // User params (main normally has none, but handle them anyway).
+        for param in params {
+            let ty = self.lower_type(&param.type_annotation);
+            self.emit_function_param(param.name.name.clone(), ty);
+        }
+
+        let terminated = self.emit_block_stmts(body, "void");
+        if !terminated {
+            self.emit("  ret void".to_string());
+        }
+
+        self.lines.join("\n")
+    }
+
+    /// Emit the thin C-style `main()` that:
+    ///   1. initialises the arena, scheduler, and I/O subsystem
+    ///   2. spawns `__ty_main_body` as a coroutine (Go-style: main IS a goroutine)
+    ///   3. drives the scheduler to completion via `ty_sched_shutdown`
+    ///   4. tears down I/O and returns 0
+    fn emit_bootstrap_main(&mut self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("entry:".to_string());
+
+        // Arena + scheduler + I/O init
+        lines.push("  %arena = call i8* @slab_arena_new()".to_string());
+        lines.push("  call void @ty_sched_init()".to_string());
+        lines.push("  call void @ty_io_subsystem_init()".to_string());
+
+        // Cast __ty_main_body to i8* function pointer and spawn it
+        lines.push(
+            "  %main_fn = bitcast void(i8*, i8*)* @__ty_main_body to i8*".to_string(),
+        );
+        lines.push(
+            "  call i8* @ty_spawn(i8* %arena, i8* %main_fn, i8* null)".to_string(),
+        );
+
+        // Run scheduler until all coroutines finish
+        lines.push("  call void @ty_sched_shutdown()".to_string());
+        lines.push("  call void @ty_io_subsystem_shutdown()".to_string());
+        lines.push("  ret i32 0".to_string());
+
+        lines.join("\n")
+    }
+
     fn emit_function_param(&mut self, name: String, lower_type: String) {
         let slot = self.tmp();
         self.emit(format!("  {} = alloca {}", slot, lower_type));
@@ -462,19 +549,18 @@ impl<'a> IrBuilder<'a> {
         match &stmt.node {
             StatementKind::Return(Some(expr)) => {
                 let val = self.emit_expr(expr);
-                let ty = self.expr_llvm_type(expr);
-                if self.current_fn_name.as_deref().map_or(false, is_main) {
-                    self.emit("  call void @ty_io_subsystem_init()".to_string());
-                    self.emit("  call void @ty_sched_shutdown()".to_string());
+                // __ty_main_body is a void coroutine — drop the return value
+                // (side-effects are already computed) and just return void.
+                // The bootstrap main() owns shutdown.
+                if self.current_fn_name.as_deref() == Some("__ty_main_body") {
+                    self.emit("  ret void".to_string());
+                } else {
+                    let ty = self.expr_llvm_type(expr);
+                    self.emit(format!("  ret {} {}", ty, val));
                 }
-                self.emit(format!("  ret {} {}", ty, val));
                 true
             }
             StatementKind::Return(None) => {
-                if self.current_fn_name.as_deref().map_or(false, is_main) {
-                    self.emit("  call void @ty_io_subsystem_init()".to_string());
-                    self.emit("  call void @ty_sched_shutdown()".to_string());
-                }
                 self.emit("  ret void".to_string());
                 true
             }
@@ -1639,8 +1725,32 @@ impl<'a> IrBuilder<'a> {
                         }
                         return "0".to_string();
                     }
+                    "recv" => {
+                        if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
+                            let elem_ty = self.lower_infer_type(&ty);
+                            self.ensure_option(&elem_ty);
+
+                            let out_slot = self.tmp();
+                            self.emit(format!("  {} = alloca {}", out_slot, elem_ty));
+                            let out_raw = self.tmp();
+                            self.emit(format!(
+                                "  {} = bitcast {}* {} to i8*",
+                                out_raw, elem_ty, out_slot
+                            ));
+                            self.emit(format!(
+                                "  call void @ty_chan_recv(i8* %task, i8* {}, i8* {})",
+                                base_val, out_raw
+                            ));
+                            let loaded = self.tmp();
+                            self.emit(format!(
+                                "  {} = load {}, {}* {}",
+                                loaded, elem_ty, elem_ty, out_slot
+                            ));
+                            return loaded;
+                        }
+                        return "0".to_string();
+                    }
                     "try_recv" => {
-                        // Non-blocking receive: use runtime `ty_chan_try_recv` and wrap as Option.
                         if let Some(ty) = self.inferred_expr_type(call_expr).cloned() {
                             if let InferType::App(ref name, ref ty_args) = ty {
                                 if name == "Option" && ty_args.len() == 1 {
@@ -1655,57 +1765,30 @@ impl<'a> IrBuilder<'a> {
                                         "  {} = bitcast {}* {} to i8*",
                                         out_raw, elem_ty, out_slot
                                     ));
-                                    let ok32 = self.tmp();
+
+                                    let success = self.tmp();
                                     self.emit(format!(
                                         "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
-                                        ok32, base_val, out_raw
+                                        success, base_val, out_raw
                                     ));
-                                    let ok = self.tmp();
-                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok, ok32));
 
-                                    // Give scheduler one chance to run blocked senders before returning None.
-                                    let some1_lbl = self.label("chan_some1");
-                                    let retry_lbl = self.label("chan_retry");
-                                    let some2_lbl = self.label("chan_some2");
-                                    let none_lbl = self.label("chan_none");
-                                    let merge_lbl = self.label("chan_merge");
+                                    let cond = self.tmp();
+                                    self.emit(format!("  {} = icmp eq i32 {}, 1", cond, success));
+                                    let some_lbl = self.label("try_recv_some");
+                                    let none_lbl = self.label("try_recv_none");
+                                    let merge_lbl = self.label("try_recv_merge");
                                     self.emit(format!(
                                         "  br i1 {}, label %{}, label %{}",
-                                        ok, some1_lbl, retry_lbl
+                                        cond, some_lbl, none_lbl
                                     ));
 
-                                    self.emit(format!("{}:", some1_lbl));
-                                    let loaded1 = self.tmp();
+                                    self.emit(format!("{}:", some_lbl));
+                                    let loaded = self.tmp();
                                     self.emit(format!(
                                         "  {} = load {}, {}* {}",
-                                        loaded1, elem_ty, elem_ty, out_slot
+                                        loaded, elem_ty, elem_ty, out_slot
                                     ));
-                                    let some1_val =
-                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded1);
-                                    self.emit(format!("  br label %{}", merge_lbl));
-
-                                    self.emit(format!("{}:", retry_lbl));
-                                    self.emit("  call void @ty_yield()".to_string());
-                                    let ok32_2 = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = call i32 @ty_chan_try_recv(i8* %task, i8* {}, i8* {})",
-                                        ok32_2, base_val, out_raw
-                                    ));
-                                    let ok2 = self.tmp();
-                                    self.emit(format!("  {} = icmp ne i32 {}, 0", ok2, ok32_2));
-                                    self.emit(format!(
-                                        "  br i1 {}, label %{}, label %{}",
-                                        ok2, some2_lbl, none_lbl
-                                    ));
-
-                                    self.emit(format!("{}:", some2_lbl));
-                                    let loaded2 = self.tmp();
-                                    self.emit(format!(
-                                        "  {} = load {}, {}* {}",
-                                        loaded2, elem_ty, elem_ty, out_slot
-                                    ));
-                                    let some2_val =
-                                        self.emit_option_some(&opt_ty, &elem_ty, &loaded2);
+                                    let some_val = self.emit_option_some(&opt_ty, &elem_ty, &loaded);
                                     self.emit(format!("  br label %{}", merge_lbl));
 
                                     self.emit(format!("{}:", none_lbl));
@@ -1715,15 +1798,8 @@ impl<'a> IrBuilder<'a> {
                                     self.emit(format!("{}:", merge_lbl));
                                     let phi = self.tmp();
                                     self.emit(format!(
-                                        "  {} = phi {} [ {}, %{} ], [ {}, %{} ], [ {}, %{} ]",
-                                        phi,
-                                        opt_ty,
-                                        some1_val,
-                                        some1_lbl,
-                                        some2_val,
-                                        some2_lbl,
-                                        none_val,
-                                        none_lbl
+                                        "  {} = phi {} [ {}, %{} ], [ {}, %{} ]",
+                                        phi, opt_ty, some_val, some_lbl, none_val, none_lbl
                                     ));
                                     return phi;
                                 }
@@ -3175,10 +3251,10 @@ mod tests {
             .unwrap_or(&std::collections::HashMap::new())
             .clone();
         let ir = Codegen::lower_module(&module, checker.types(), &drop_map);
-        assert_eq!(ir.functions.len(), 1);
+        assert_eq!(ir.functions.len(), 2);
         assert_eq!(ir.functions[0].name, "main");
         assert_eq!(ir.functions[0].ret_type, "i32");
-        assert_eq!(ir.functions[0].params.len(), 1);
+        assert_eq!(ir.functions[0].params.len(), 0);
     }
 
     #[test]

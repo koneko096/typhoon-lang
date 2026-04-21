@@ -74,7 +74,7 @@ fn main() {
     let mut cmd = Command::new("clang");
 
     // 1. Specify the input IR (use -x ir if your file doesn't end in .ll)
-    cmd.arg(ll_path.as_os_str());
+    cmd.arg("-v").arg(ll_path.as_os_str());
 
     // 2. Stop 'ir' mode so it doesn't try to parse the library as IR
     cmd.arg("-x").arg("none");
@@ -86,7 +86,25 @@ fn main() {
     // Clang will find runtime.lib on Windows or libruntime.a on Unix
     cmd.arg("-lruntime");
 
-    // 5. Add output flags
+    // 5. Platform-Specific Glue
+    if cfg!(windows) {
+        // Forces Clang to link against the Static CRT (libcmt.lib)
+        // This resolves the "__imp_strtod" errors
+        cmd.arg("-fms-runtime-lib=static");
+    } else {
+        // Linux and macOS need to link the math library and threads
+        // if your runtime uses any C-standard headers or threading.
+        cmd.arg("-lm");
+        cmd.arg("-lpthread");
+        cmd.arg("-fno-omit-frame-pointer");
+
+        if cfg!(target_os = "linux") {
+            // Required for some low-level runtime features on Linux
+            cmd.arg("-ldl");
+        }
+    }
+
+    // 6. Add output flags
     cmd.arg("-o").arg(&output);
 
     match cmd.status() {

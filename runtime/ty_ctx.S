@@ -21,6 +21,19 @@
 /* ── x86-64 ──────────────────────────────────────────────────────────── */
 #if defined(__x86_64__) || defined(__amd64__)
 
+.data
+.globl SYM(ty__entry_rsp)
+.globl ty__entry_rsp
+SYM(ty__entry_rsp):
+ty__entry_rsp:
+    .quad 0
+
+.globl SYM(ty__entry_top)
+.globl ty__entry_top
+SYM(ty__entry_top):
+ty__entry_top:
+    .quad 0
+
 .text
 
 /*
@@ -34,16 +47,18 @@
 .globl ty_ctx_swap
 SYM(ty_ctx_swap):
 ty_ctx_swap:
-    movq %rsp,  0(%rdi)
-    movq %r15,  8(%rdi)
-    movq %r14, 16(%rdi)
-    movq %r13, 24(%rdi)
-    movq %r12, 32(%rdi)
-    movq %rbx, 40(%rdi)
-    movq %rbp, 48(%rdi)
-    leaq 8(%rip), %rax          /* address of instruction after jmpq   */
-    movq %rax,  56(%rdi)
+    movq (%rsp), %rax     /* read return addr pushed by 'call ty_ctx_swap' */
+    movq %rax,  56(%rdi)  /* save it as the true resume RIP                */
+    leaq 8(%rsp), %rax    /* compute post-call RSP (past the return addr)   */
+    movq %rax,   0(%rdi)  /* save adjusted RSP                             */
+    movq %r15,   8(%rdi)
+    movq %r14,  16(%rdi)
+    movq %r13,  24(%rdi)
+    movq %r12,  32(%rdi)
+    movq %rbx,  40(%rdi)
+    movq %rbp,  48(%rdi)
 
+    /* restore block unchanged */
     movq  0(%rsi), %rsp
     movq  8(%rsi), %r15
     movq 16(%rsi), %r14
@@ -66,12 +81,10 @@ ty_ctx_swap:
 .globl ty__coro_entry
 SYM(ty__coro_entry):
 ty__coro_entry:
-    popq %rdi                   /* tramp                               */
-    popq %rsi                   /* hi                                  */
-    popq %rdx                   /* lo                                  */
-    movl %esi, %edi             /* hi → first  arg (uint32_t)          */
-    movl %edx, %esi             /* lo → second arg (uint32_t)          */
-    jmpq *%rdi                  /* tail-call tramp(hi, lo)             */
+    popq %rax                   /* tramp → scratch register    */
+    popq %rdi                   /* hi   → first  arg (uint32_t) */
+    popq %rsi                   /* lo   → second arg (uint32_t) */
+    jmpq *%rax                  /* tail-call tramp(hi, lo)      */
 
 /* ── AArch64 ─────────────────────────────────────────────────────────── */
 #elif defined(__aarch64__)
@@ -99,6 +112,11 @@ ty_ctx_swap:
     stp x29, x30, [x0, #80]
     mov x9,  sp
     str x9,  [x0, #96]
+    /* Save callee-saved SIMD registers (lower 64 bits) */
+    stp d8,  d9,  [x0, #104]
+    stp d10, d11, [x0, #120]
+    stp d12, d13, [x0, #136]
+    stp d14, d15, [x0, #152]
 
     ldp x19, x20, [x1,  #0]
     ldp x21, x22, [x1, #16]
@@ -108,7 +126,12 @@ ty_ctx_swap:
     ldp x29, x30, [x1, #80]
     ldr x9,  [x1, #96]
     mov sp,  x9
-    ret                         /* branches to restored x30 (lr)       */
+    /* Restore callee-saved SIMD registers */
+    ldp d8,  d9,  [x1, #104]
+    ldp d10, d11, [x1, #120]
+    ldp d12, d13, [x1, #136]
+    ldp d14, d15, [x1, #152]
+    ret
 
 /*
  * ty__coro_entry — first entry point for a new coroutine.

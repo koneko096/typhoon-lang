@@ -38,6 +38,7 @@
 #include <string.h>
 #include "platform.h"
 #include "atomic.h"
+#include "scheduler.h"
 #include "io_driver.h"
 
 /* ── platform includes ───────────────────────────────────────────────────────── */
@@ -64,72 +65,29 @@
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- *  Shared: per-coroutine I/O result slot (lock-free open-addressing hash)
+ *  I/O Results (Task-local)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-#define IO_RESULT_CAP   1024u          /* must be power of two  */
-#define IO_RESULT_MASK  (IO_RESULT_CAP - 1u)
-
-typedef struct {
-    _Atomic(uintptr_t) key;    /* (uintptr_t)coro_ptr, 0 = empty */
-    _Atomic(int64_t)   result;
-} IoResultSlot;
-
-static IoResultSlot io_result_table[IO_RESULT_CAP];
-
-static void io_result_store(void* coro, int64_t result) {
-    uintptr_t key = (uintptr_t)coro;
-    uint32_t  idx = (uint32_t)(key >> 4u) & IO_RESULT_MASK;
-    for (uint32_t i = 0; i < IO_RESULT_CAP; i++) {
-        uint32_t  s   = (idx + i) & IO_RESULT_MASK;
-        uintptr_t exp = 0;
-        /* Try to claim an empty slot */
-        if (atomic_compare_exchange_strong_explicit(
-                &io_result_table[s].key, &exp, key,
-                memory_order_acquire, memory_order_relaxed)) {
-            atomic_store_explicit(&io_result_table[s].result,
-                                  result, memory_order_release);
-            return;
-        }
-        /* Slot already belongs to this coro (re-used across ops) */
-        if (atomic_load_explicit(&io_result_table[s].key,
-                                 memory_order_relaxed) == key) {
-            atomic_store_explicit(&io_result_table[s].result,
-                                  result, memory_order_release);
-            return;
-        }
-    }
-    /* Table full — should never happen (at most one in-flight op per coro) */
+void ty_io_wake_coro(void* coro, int64_t result)
+{
+    if (!coro)
+        return;
+    ty_coro_set_io_result(coro, result);
+    sched_enqueue_from_external(coro); /* defined in scheduler.c */
 }
 
-// int64_t ty_io_take_result(void* coro) {
-//     uintptr_t key = (uintptr_t)coro;
-//     uint32_t  idx = (uint32_t)(key >> 4u) & IO_RESULT_MASK;
-//     for (uint32_t i = 0; i < IO_RESULT_CAP; i++) {
-//         uint32_t s = (idx + i) & IO_RESULT_MASK;
-//         if (atomic_load_explicit(&io_result_table[s].key,
-//                                  memory_order_acquire) == key) {
-//             int64_t r = atomic_load_explicit(&io_result_table[s].result,
-//                                              memory_order_acquire);
-//             atomic_store_explicit(&io_result_table[s].key,
-//                                   0u, memory_order_release);
-//             return r;
-//         }
-//     }
-//     return -1; /* not found — shouldn't happen */
-// }
+int64_t ty_io_take_result(void* coro)
+{
+    return ty_coro_get_io_result(coro);
+}
 
 /* ── Park / wake ──────────────────────────────────────────────────────────────── */
 
-// void ty_io_park_coro(void* task) {
-//     (void)task;
-//     ty_coro_block_and_yield();   /* defined in scheduler.c */
-// }
-
-// void ty_io_wake_coro(void* coro, int64_t result) {
-//     io_result_store(coro, result);
-//     sched_enqueue_from_external(coro); /* defined in scheduler.c */
-// }
+void ty_io_park_coro(SlabArena* arena)
+{
+    (void)arena;
+    ty_coro_block_and_yield(); /* defined in scheduler.c */
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Pending request pool
@@ -199,9 +157,12 @@ typedef struct {
 
 typedef struct UringDriver {
     int            ring_fd;
-    uint8_t*       sq_ring;   size_t sq_ring_sz;
-    uint8_t*       cq_ring;   size_t cq_ring_sz;
-    struct io_uring_sqe* sqes; size_t sqes_sz;
+    uint8_t*       sq_ring;
+    size_t         sq_ring_sz;
+    uint8_t*       cq_ring;
+    size_t         cq_ring_sz;
+    struct io_uring_sqe* sqes;
+    size_t         sqes_sz;
     uint32_t       sq_mask;
     uint32_t       cq_mask;
     UringLayout    layout;
@@ -209,7 +170,7 @@ typedef struct UringDriver {
     /* token → PendingReq* lookup: simple array indexed by token % PENDING_CAP */
     PendingReq*    token_map[PENDING_CAP];
     _Atomic(uint64_t) next_token;
-    TyMutex        submit_lock;   /* serialize SQ writes from worker threads */
+    TyMutex        submit_lock; /* serialize SQ writes from worker threads */
 } UringDriver;
 
 static int uring_setup(uint32_t entries, struct io_uring_params* p) {
@@ -228,46 +189,65 @@ static UringDriver* uring_new(void) {
 
     /* mmap SQ ring */
     size_t sq_sz = params.sq_off.array + params.sq_entries * sizeof(uint32_t);
-    void*  sq    = mmap(NULL, sq_sz, PROT_READ|PROT_WRITE,
-                        MAP_SHARED|MAP_POPULATE, rfd, IORING_OFF_SQ_RING);
-    if (sq == MAP_FAILED) { close(rfd); return NULL; }
+    void* sq = mmap(NULL, sq_sz, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_POPULATE, rfd, IORING_OFF_SQ_RING);
+    if (sq == MAP_FAILED) {
+        close(rfd);
+        return NULL;
+    }
 
     /* mmap SQEs */
     size_t sqe_sz = params.sq_entries * sizeof(struct io_uring_sqe);
-    void*  sqes   = mmap(NULL, sqe_sz, PROT_READ|PROT_WRITE,
-                         MAP_SHARED|MAP_POPULATE, rfd, IORING_OFF_SQES);
-    if (sqes == MAP_FAILED) { munmap(sq, sq_sz); close(rfd); return NULL; }
+    void* sqes = mmap(NULL, sqe_sz, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_POPULATE, rfd, IORING_OFF_SQES);
+    if (sqes == MAP_FAILED) {
+        munmap(sq, sq_sz);
+        close(rfd);
+        return NULL;
+    }
 
     /* mmap CQ ring */
     size_t cq_sz = params.cq_off.cqes
-                 + params.cq_entries * sizeof(struct io_uring_cqe);
-    void*  cq    = mmap(NULL, cq_sz, PROT_READ|PROT_WRITE,
-                        MAP_SHARED|MAP_POPULATE, rfd, IORING_OFF_CQ_RING);
+        + params.cq_entries * sizeof(struct io_uring_cqe);
+    void* cq = mmap(NULL, cq_sz, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_POPULATE, rfd, IORING_OFF_CQ_RING);
     if (cq == MAP_FAILED) {
-        munmap(sqes, sqe_sz); munmap(sq, sq_sz); close(rfd); return NULL;
+        munmap(sqes, sqe_sz);
+        munmap(sq, sq_sz);
+        close(rfd);
+        return NULL;
     }
 
     UringDriver* d = (UringDriver*)ty_vm_alloc(sizeof(UringDriver));
-    if (!d) { munmap(cq,cq_sz); munmap(sqes,sqe_sz); munmap(sq,sq_sz); close(rfd); return NULL; }
+    if (!d) {
+        munmap(cq, cq_sz);
+        munmap(sqes, sqe_sz);
+        munmap(sq, sq_sz);
+        close(rfd);
+        return NULL;
+    }
     memset(d, 0, sizeof(*d));
 
-    d->ring_fd    = rfd;
-    d->sq_ring    = (uint8_t*)sq;  d->sq_ring_sz = sq_sz;
-    d->cq_ring    = (uint8_t*)cq;  d->cq_ring_sz = cq_sz;
-    d->sqes       = (struct io_uring_sqe*)sqes; d->sqes_sz = sqe_sz;
-    d->sq_mask    = *(uint32_t*)((uint8_t*)sq + params.sq_off.ring_mask);
-    d->cq_mask    = *(uint32_t*)((uint8_t*)cq + params.cq_off.ring_mask);
+    d->ring_fd = rfd;
+    d->sq_ring = (uint8_t*)sq;
+    d->sq_ring_sz = sq_sz;
+    d->cq_ring = (uint8_t*)cq;
+    d->cq_ring_sz = cq_sz;
+    d->sqes = (struct io_uring_sqe*)sqes;
+    d->sqes_sz = sqe_sz;
+    d->sq_mask = *(uint32_t*)((uint8_t*)sq + params.sq_off.ring_mask);
+    d->cq_mask = *(uint32_t*)((uint8_t*)cq + params.cq_off.ring_mask);
 
-    d->layout.sq_head_off  = params.sq_off.head;
-    d->layout.sq_tail_off  = params.sq_off.tail;
-    d->layout.sq_mask_off  = params.sq_off.ring_mask;
+    d->layout.sq_head_off = params.sq_off.head;
+    d->layout.sq_tail_off = params.sq_off.tail;
+    d->layout.sq_mask_off = params.sq_off.ring_mask;
     d->layout.sq_array_off = params.sq_off.array;
-    d->layout.cq_head_off  = params.cq_off.head;
-    d->layout.cq_tail_off  = params.cq_off.tail;
-    d->layout.cq_mask_off  = params.cq_off.ring_mask;
-    d->layout.cq_cqes_off  = params.cq_off.cqes;
-    d->layout.sq_entries   = params.sq_entries;
-    d->layout.cq_entries   = params.cq_entries;
+    d->layout.cq_head_off = params.cq_off.head;
+    d->layout.cq_tail_off = params.cq_off.tail;
+    d->layout.cq_mask_off = params.cq_off.ring_mask;
+    d->layout.cq_cqes_off = params.cq_off.cqes;
+    d->layout.sq_entries = params.sq_entries;
+    d->layout.cq_entries = params.cq_entries;
 
     atomic_init(&d->next_token, 1u);
     ty_mutex_init(&d->submit_lock);
@@ -280,24 +260,24 @@ static void uring_submit(UringDriver* d, PendingReq* req) {
     /* Build a per-request iovec on the heap (must outlive the submission) */
     struct iovec* iov = (struct iovec*)ty_vm_alloc(sizeof(struct iovec));
     iov->iov_base = req->buf;
-    iov->iov_len  = req->len;
+    iov->iov_len = req->len;
 
     ty_mutex_lock(&d->submit_lock);
 
     uint32_t* sq_tail_ptr = (uint32_t*)(d->sq_ring + d->layout.sq_tail_off);
     uint32_t* sq_head_ptr = (uint32_t*)(d->sq_ring + d->layout.sq_head_off);
-    uint32_t* sq_array    = (uint32_t*)(d->sq_ring + d->layout.sq_array_off);
+    uint32_t* sq_array = (uint32_t*)(d->sq_ring + d->layout.sq_array_off);
 
     uint32_t tail = *sq_tail_ptr;
     (void)sq_head_ptr;
-    uint32_t idx  = tail & d->sq_mask;
+    uint32_t idx = tail & d->sq_mask;
 
     struct io_uring_sqe* sqe = &d->sqes[idx];
     memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode    = req->is_write ? IORING_OP_WRITEV : IORING_OP_READV;
-    sqe->fd        = req->fd;
-    sqe->addr      = (uint64_t)(uintptr_t)iov;
-    sqe->len       = 1;
+    sqe->opcode = req->is_write ? IORING_OP_WRITEV : IORING_OP_READV;
+    sqe->fd = req->fd;
+    sqe->addr = (uint64_t)(uintptr_t)iov;
+    sqe->len = 1;
     sqe->user_data = token;
 
     sq_array[idx] = idx;
@@ -320,8 +300,7 @@ static void uring_poll(UringDriver* d) {
 
     uint32_t* cq_head_ptr = (uint32_t*)(d->cq_ring + d->layout.cq_head_off);
     uint32_t* cq_tail_ptr = (uint32_t*)(d->cq_ring + d->layout.cq_tail_off);
-    struct io_uring_cqe* cqes =
-        (struct io_uring_cqe*)(d->cq_ring + d->layout.cq_cqes_off);
+    struct io_uring_cqe* cqes = (struct io_uring_cqe*)(d->cq_ring + d->layout.cq_cqes_off);
 
     __sync_synchronize();
     uint32_t head = *cq_head_ptr;
@@ -331,7 +310,7 @@ static void uring_poll(UringDriver* d) {
     while (head != tail) {
         struct io_uring_cqe* cqe = &cqes[head & d->cq_mask];
         uint64_t token = cqe->user_data;
-        int32_t  res   = cqe->res;
+        int32_t res = cqe->res;
         head++;
 
         PendingReq* req = d->token_map[token % PENDING_CAP];
@@ -350,19 +329,22 @@ static void uring_poll(UringDriver* d) {
 
 static void uring_destroy(UringDriver* d) {
     ty_mutex_destroy(&d->submit_lock);
-    munmap(d->sq_ring,  d->sq_ring_sz);
-    munmap(d->sqes,     d->sqes_sz);
-    munmap(d->cq_ring,  d->cq_ring_sz);
+    munmap(d->sq_ring, d->sq_ring_sz);
+    munmap(d->sqes, d->sqes_sz);
+    munmap(d->cq_ring, d->cq_ring_sz);
     close(d->ring_fd);
     ty_vm_free(d, sizeof(UringDriver));
 }
 
 /* open / close thin wrappers */
-static int  uring_open (const char* path, int flags, unsigned mode) {
+static int uring_open(const char* path, int flags, unsigned mode) {
     int oflags = 0;
-    if (flags == 0) oflags = O_RDONLY;
-    else if (flags == 1) oflags = O_WRONLY | O_CREAT | O_TRUNC;
-    else oflags = O_RDWR | O_CREAT;
+    if (flags == 0)
+        oflags = O_RDONLY;
+    else if (flags == 1)
+        oflags = O_WRONLY | O_CREAT | O_TRUNC;
+    else
+        oflags = O_RDWR | O_CREAT;
     return open(path, oflags, (mode_t)mode);
 }
 static void uring_close(int fd) { close(fd); }
@@ -383,7 +365,10 @@ static KqDriver* kq_new(void) {
     int kq = kqueue();
     if (kq < 0) return NULL;
     KqDriver* d = (KqDriver*)ty_vm_alloc(sizeof(KqDriver));
-    if (!d) { close(kq); return NULL; }
+    if (!d) {
+        close(kq);
+        return NULL;
+    }
     memset(d, 0, sizeof(*d));
     d->kq = kq;
     ty_mutex_init(&d->lock);
@@ -393,10 +378,10 @@ static KqDriver* kq_new(void) {
 static void kq_submit(KqDriver* d, PendingReq* req) {
     struct kevent64_s ev;
     memset(&ev, 0, sizeof(ev));
-    ev.ident  = (uint64_t)req->fd;
+    ev.ident = (uint64_t)req->fd;
     ev.filter = req->is_write ? EVFILT_WRITE : EVFILT_READ;
-    ev.flags  = EV_ADD | EV_ENABLE | EV_ONESHOT;
-    ev.udata  = (uint64_t)(uintptr_t)req;
+    ev.flags = EV_ADD | EV_ENABLE | EV_ONESHOT;
+    ev.udata = (uint64_t)(uintptr_t)req;
     kevent64(d->kq, &ev, 1, NULL, 0, 0, NULL);
 }
 
@@ -412,7 +397,8 @@ static void kq_poll(KqDriver* d) {
             result = (int64_t)write(req->fd, req->buf, req->len);
         else
             result = (int64_t)read(req->fd, req->buf, req->len);
-        if (result < 0) result = -(int64_t)errno;
+        if (result < 0)
+            result = -(int64_t)errno;
         ty_io_wake_coro(req->coro, result);
         pool_free(req);
     }
@@ -424,11 +410,14 @@ static void kq_destroy(KqDriver* d) {
     ty_vm_free(d, sizeof(KqDriver));
 }
 
-static int  kq_open(const char* path, int flags, unsigned mode) {
+static int kq_open(const char* path, int flags, unsigned mode) {
     int oflags = 0;
-    if (flags == 0) oflags = O_RDONLY;
-    else if (flags == 1) oflags = O_WRONLY | O_CREAT | O_TRUNC;
-    else oflags = O_RDWR | O_CREAT;
+    if (flags == 0)
+        oflags = O_RDONLY;
+    else if (flags == 1)
+        oflags = O_WRONLY | O_CREAT | O_TRUNC;
+    else
+        oflags = O_RDWR | O_CREAT;
     return open(path, oflags, (mode_t)mode);
 }
 static void kq_close(int fd) { close(fd); }
@@ -439,7 +428,7 @@ static void kq_close(int fd) { close(fd); }
 #elif defined(_WIN32)
 
 typedef struct IocpOverlapped {
-    OVERLAPPED  ov;        /* MUST be first field */
+    OVERLAPPED  ov;     /* MUST be first field */
     PendingReq* req;
 } IocpOverlapped;
 
@@ -453,7 +442,10 @@ static IocpDriver* iocp_new(void) {
     HANDLE h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (!h) return NULL;
     IocpDriver* d = (IocpDriver*)ty_vm_alloc(sizeof(IocpDriver));
-    if (!d) { CloseHandle(h); return NULL; }
+    if (!d) {
+        CloseHandle(h);
+        return NULL;
+    }
     memset(d, 0, sizeof(*d));
     d->iocp = h;
     ty_mutex_init(&d->lock);
@@ -461,8 +453,39 @@ static IocpDriver* iocp_new(void) {
 }
 
 static void iocp_submit(IocpDriver* d, PendingReq* req) {
+    HANDLE fh;
+
+    if (req->fd == 1) {
+        fh = GetStdHandle(STD_OUTPUT_HANDLE);
+    } else if (req->fd == 2) {
+        fh = GetStdHandle(STD_ERROR_HANDLE);
+    } else {
+        fh = (HANDLE)(uintptr_t)(UINT_PTR)(unsigned int)req->fd;
+    }
+
+    if (fh == INVALID_HANDLE_VALUE || fh == NULL) {
+        ty_io_wake_coro(req->coro, -1);
+        pool_free(req);
+        return;
+    }
+
+    /*
+     * Console stdout/stderr cannot go through IOCP WriteFile reliably.
+     * Probe for a real console and fall back to synchronous WriteConsoleA.
+     * Redirected stdout/stderr still use the async path.
+     */
+    if (req->is_write && (req->fd == 1 || req->fd == 2)) {
+        DWORD mode = 0;
+        if (GetConsoleMode(fh, &mode)) {
+            DWORD written = 0;
+            BOOL ok = WriteConsoleA(fh, req->buf, (DWORD)req->len, &written, NULL);
+            ty_io_wake_coro(req->coro, ok ? (int64_t)written : -(int64_t)GetLastError());
+            pool_free(req);
+            return;
+        }
+    }
+
     /* Associate handle with IOCP (idempotent) */
-    HANDLE fh = (HANDLE)(uintptr_t)(UINT_PTR)(unsigned int)req->fd;
     CreateIoCompletionPort(fh, d->iocp, (ULONG_PTR)req->coro, 0);
 
     IocpOverlapped* ov = (IocpOverlapped*)ty_vm_alloc(sizeof(IocpOverlapped));
@@ -492,8 +515,8 @@ static void iocp_poll(IocpDriver* d) {
     BOOL ok = GetQueuedCompletionStatus(d->iocp, &bytes, &key, &raw_ov, 1 /*1ms*/);
     if (!raw_ov) return;
 
-    IocpOverlapped* ov  = (IocpOverlapped*)raw_ov;
-    PendingReq*     req = ov->req;
+    IocpOverlapped* ov = (IocpOverlapped*)raw_ov;
+    PendingReq* req = ov->req;
     int64_t result = ok ? (int64_t)bytes : -(int64_t)GetLastError();
     ty_io_wake_coro(req->coro, result);
     pool_free(req);
@@ -515,13 +538,14 @@ static int iocp_open(const char* path, int flags, unsigned mode) {
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
 
     DWORD access = (flags == 0) ? GENERIC_READ
-                 : (flags == 1) ? GENERIC_WRITE
+        : (flags == 1)          ? GENERIC_WRITE
                                 : (GENERIC_READ | GENERIC_WRITE);
-    DWORD disp   = (flags == 0) ? OPEN_EXISTING : CREATE_ALWAYS;
+    DWORD disp = (flags == 0) ? OPEN_EXISTING : CREATE_ALWAYS;
     HANDLE h = CreateFileW(wpath, access, FILE_SHARE_READ, NULL,
-                           disp, FILE_FLAG_OVERLAPPED, NULL);
+        disp, FILE_FLAG_OVERLAPPED, NULL);
     ty_vm_free(wpath, (size_t)wlen * sizeof(WCHAR));
-    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (h == INVALID_HANDLE_VALUE)
+        return -1;
     /* Cast HANDLE to int — callers must use iocp_close to release it */
     return (int)(UINT_PTR)h;
 }
@@ -560,11 +584,11 @@ typedef struct IoDriver {
 
 /* ── Global state ─────────────────────────────────────────────────────────────── */
 
-static IoDriver          g_driver;
-static _Atomic(int)      g_poll_running;
-static TyThread          g_poll_thread;
+static IoDriver     g_driver;
+static _Atomic(int) g_poll_running;
+static TyThread     g_poll_thread;
 
-// void* ty_io_global_driver(void) { return &g_driver; }
+void* ty_io_global_driver(void) { return &g_driver; }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Poll thread
@@ -589,42 +613,46 @@ static void* io_poll_thread(void* arg) {
  *  Subsystem lifecycle
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-// void ty_io_subsystem_init(void) {
-//     memset(io_result_table, 0, sizeof(io_result_table));
-//     memset(&g_driver, 0, sizeof(g_driver));
+static int g_subsystem_initialized = 0;
 
-// #if defined(__linux__)
-//     g_driver.impl = uring_new();
-// #elif defined(__APPLE__)
-//     g_driver.impl = kq_new();
-// #elif defined(_WIN32)
-//     g_driver.impl = iocp_new();
-// #endif
+void ty_io_subsystem_init(void) {
+    if (g_subsystem_initialized)
+        return;
+    memset(&g_driver, 0, sizeof(g_driver));
+    g_subsystem_initialized = 1;
 
-//     atomic_init(&g_poll_running, 1);
+#if defined(__linux__)
+    g_driver.impl = uring_new();
+#elif defined(__APPLE__)
+    g_driver.impl = kq_new();
+#elif defined(_WIN32)
+    g_driver.impl = iocp_new();
+#endif
 
-//     if (g_driver.impl) {
-//         if (!ty_thread_create(&g_poll_thread, io_poll_thread, NULL)) {
-//             /* Non-fatal: poll loop driven inline (degraded to blocking I/O) */
-//             atomic_store_explicit(&g_poll_running, 0, memory_order_relaxed);
-//         }
-//     }
-// }
+    atomic_init(&g_poll_running, 1);
 
-// void ty_io_subsystem_shutdown(void) {
-//     atomic_store_explicit(&g_poll_running, 0, memory_order_release);
-//     if (g_driver.impl) {
-//         ty_thread_join(g_poll_thread);
-// #if defined(__linux__)
-//         uring_destroy(g_driver.impl);
-// #elif defined(__APPLE__)
-//         kq_destroy(g_driver.impl);
-// #elif defined(_WIN32)
-//         iocp_destroy(g_driver.impl);
-// #endif
-//         g_driver.impl = NULL;
-//     }
-// }
+    if (g_driver.impl) {
+        if (!ty_thread_create(&g_poll_thread, io_poll_thread, NULL)) {
+            /* Non-fatal: poll loop driven inline (degraded to blocking I/O) */
+            atomic_store_explicit(&g_poll_running, 0, memory_order_relaxed);
+        }
+    }
+}
+
+void ty_io_subsystem_shutdown(void) {
+    atomic_store_explicit(&g_poll_running, 0, memory_order_release);
+    if (g_driver.impl) {
+        ty_thread_join(g_poll_thread);
+#if defined(__linux__)
+        uring_destroy(g_driver.impl);
+#elif defined(__APPLE__)
+        kq_destroy(g_driver.impl);
+#elif defined(_WIN32)
+        iocp_destroy(g_driver.impl);
+#endif
+        g_driver.impl = NULL;
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  *  Public file open / close
@@ -639,7 +667,10 @@ int ty_io_open(void* driver, const char* path, int flags, unsigned mode) {
 #elif defined(_WIN32)
     return iocp_open(path, flags, mode);
 #else
-    (void)path; (void)flags; (void)mode; return -1;
+    (void)path;
+    (void)flags;
+    (void)mode;
+    return -1;
 #endif
 }
 
@@ -673,11 +704,10 @@ void ty_io_close(void* driver, int fd) {
  * and store the result directly so ty_io_take_result() works the same way.
  */
 
-static void do_submit_or_sync(void* driver_ptr, void* task, void* coro,
-                               int fd, uint8_t* buf, size_t len, int is_write) {
+static void do_submit_or_sync(void* driver_ptr, SlabArena* arena, void* coro,
+    int fd, uint8_t* buf, size_t len, int is_write) {
     IoDriver* d = (IoDriver*)driver_ptr;
-    int has_driver = (d && d->impl &&
-        atomic_load_explicit(&g_poll_running, memory_order_acquire));
+    int has_driver = (d && d->impl && atomic_load_explicit(&g_poll_running, memory_order_acquire));
 
     if (coro && has_driver) {
         PendingReq* req = pool_alloc(
@@ -692,10 +722,10 @@ static void do_submit_or_sync(void* driver_ptr, void* task, void* coro,
 #endif
         );
         if (req) {
-            req->fd       = fd;
-            req->buf      = buf;
-            req->len      = len;
-            req->coro     = coro;
+            req->fd = fd;
+            req->buf = buf;
+            req->len = len;
+            req->coro = coro;
             req->is_write = is_write;
 
 #if defined(__linux__)
@@ -705,7 +735,7 @@ static void do_submit_or_sync(void* driver_ptr, void* task, void* coro,
 #elif defined(_WIN32)
             iocp_submit((IocpDriver*)d->impl, req);
 #endif
-            ty_io_park_coro(task);  /* yields; result stored by poll thread */
+            ty_io_park_coro(arena); /* yields; result stored by poll thread */
             return;
         }
         /* Pool exhausted — fall through to blocking I/O */
@@ -716,38 +746,57 @@ static void do_submit_or_sync(void* driver_ptr, void* task, void* coro,
 #if defined(_WIN32)
     if (fd <= 2) {
         result = is_write ? iocp_stdio_write(fd, buf, len)
-                          : iocp_stdio_read (fd, buf, len);
+                          : iocp_stdio_read(fd, buf, len);
     } else {
         HANDLE h = (HANDLE)(UINT_PTR)(unsigned int)fd;
         DWORD n = 0;
         BOOL ok = is_write ? WriteFile(h, buf, (DWORD)len, &n, NULL)
-                           : ReadFile (h, buf, (DWORD)len, &n, NULL);
+                           : ReadFile(h, buf, (DWORD)len, &n, NULL);
         result = ok ? (int64_t)n : -(int64_t)GetLastError();
     }
 #else
     {
         ssize_t n;
         if (is_write) {
-            do { n = write(fd, buf, len); } while (n < 0 && errno == EINTR);
+            do {
+                n = write(fd, buf, len);
+            } while (n < 0 && errno == EINTR);
         } else {
-            do { n = read(fd, buf, len);  } while (n < 0 && errno == EINTR);
+            do {
+                n = read(fd, buf, len);
+            } while (n < 0 && errno == EINTR);
         }
         result = (int64_t)(n < 0 ? -errno : n);
     }
 #endif
     /* Store result so ty_io_take_result() is always the retrieval point */
-    if (coro) io_result_store(coro, result);
-    (void)task;
+    if (coro)
+        ty_coro_set_io_result(coro, result);
+    (void)arena;
 }
 
-// int64_t ty_io_read(void* driver, void* task, void* coro,
-//                    int fd, uint8_t* buf, size_t len) {
-//     do_submit_or_sync(driver, task, coro, fd, buf, len, 0);
-//     return 0; /* actual value via ty_io_take_result(coro) in ty_io.c */
-// }
+int64_t ty_coro_get_io_result(void* coro) {
+    if (!coro)
+        return 0;
+    TyCoro* co = (TyCoro*)coro;
+    return atomic_load_explicit(&co->io_result, memory_order_acquire);
+}
 
-// int64_t ty_io_write(void* driver, void* task, void* coro,
-//                     int fd, const uint8_t* buf, size_t len) {
-//     do_submit_or_sync(driver, task, coro, fd, (uint8_t*)buf, len, 1);
-//     return 0;
-// }
+void ty_coro_set_io_result(void* coro, int64_t res) {
+    if (!coro)
+        return;
+    TyCoro* co = (TyCoro*)coro;
+    atomic_store_explicit(&co->io_result, res, memory_order_release);
+}
+
+int64_t ty_io_read(void* driver, SlabArena* arena, void* coro,
+    int fd, uint8_t* buf, size_t len) {
+    do_submit_or_sync(driver, arena, coro, fd, buf, len, 0);
+    return 0; /* actual value via ty_io_take_result(coro) in ty_io.c */
+}
+
+int64_t ty_io_write(void* driver, SlabArena* arena, void* coro,
+    int fd, const uint8_t* buf, size_t len) {
+    do_submit_or_sync(driver, arena, coro, fd, (uint8_t*)buf, len, 1);
+    return 0;
+}

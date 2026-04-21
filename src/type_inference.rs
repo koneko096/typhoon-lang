@@ -551,6 +551,7 @@ impl TypeChecker {
                                     }
                                     InferType::Con("Unit".into())
                                 }
+                                "recv" => elem,
                                 "try_recv" => InferType::App("Option".into(), vec![elem]),
                                 _ => {
                                     let method_name =

@@ -899,7 +899,17 @@ impl Parser {
     fn primary_postfix(&mut self, mut expr: Expression) -> Result<Expression, String> {
         loop {
             if self.match_token(TokenType::Dot) {
-                let field = self.identifier_with_span()?;
+                let field = match self.peek_token().token_type {
+                    TokenType::Identifier => self.identifier_with_span()?,
+                    TokenType::Recv => {
+                        let token = self.advance_token();
+                        Identifier {
+                            name: token.lexeme,
+                            span: token.span,
+                        }
+                    }
+                    _ => return Err(format!("Expected identifier, got {:?}", self.peek_token())),
+                };
                 expr = self.make_expr(ExpressionKind::FieldAccess {
                     base: Box::new(expr),
                     field,

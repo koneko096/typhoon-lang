@@ -1,9 +1,20 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15) # 3.15+ is better for MSVC runtime abstraction
 project(Typhoon C)
 
 # Enable Assembly support
 enable_language(ASM)
 
+# 1. THE CRT FIX (Windows-Specific but safe for others)
+# This is the modern, "correct" way to force Static CRT in CMake 3.15+
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
+    # On Linux/macOS, we don't need to do anything special for 'static libc' usually,
+    # but we can ensure position independent code for the static library.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# 2. DEFINE THE LIBRARY
 add_library(runtime STATIC
     runtime/platform.h
     runtime/atomic.h
@@ -14,23 +25,31 @@ add_library(runtime STATIC
     runtime/io_driver.c
     runtime/scheduler.c
     runtime/ty_mem.c
-    runtime/ty_io.c)
+    runtime/ty_io.c
+)
 
-if(NOT APPLE)
-    set_target_properties(runtime PROPERTIES LINK_FLAGS "-static")
-endif()
-
-# Define a single output directory
+# 3. OUTPUT MANAGEMENT
 set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/output")
-file(MAKE_DIRECTORY ${OUTPUT_DIR})
 
-# Force static libraries (.a / .lib) to this directory
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR})
+# Set the output directory for all configurations (Debug, Release, etc.)
+set_target_properties(runtime PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
+)
 
-# Copy the artifact to the flat directory after build
+# Ensure multi-config generators (like VS) don't add /Debug or /Release subfolders
+foreach(config ${CMAKE_CONFIGURATION_TYPES})
+    string(TOUPPER ${config} CONFIG_UPPER)
+    set_target_properties(runtime PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY_${CONFIG_UPPER} "${OUTPUT_DIR}"
+    )
+endforeach()
+
+# 4. POST-BUILD COPY (Optional, as the properties above handle most cases)
 add_custom_command(TARGET runtime POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:runtime>
         "${OUTPUT_DIR}/"
-    COMMENT "Copying runtime artifact to global output directory"
+    COMMENT "Ensuring runtime artifact is in ${OUTPUT_DIR}"
 )
