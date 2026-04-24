@@ -113,7 +113,7 @@ impl Codegen {
                             .collect();
                         param_list.insert(0, ("task".to_string(), "i8*".to_string()));
                         Some(IrFunction {
-                            name: name.name.clone(),
+                            name: link_symbol_name(&name.name),   // ← apply the same mangling
                             body: body_ir,
                             ret_type: ret_ty,
                             params: param_list,
@@ -125,6 +125,86 @@ impl Codegen {
             })
             .collect();
         all_functions.extend(b.conc_functions.drain(..));
+        // ── OS entrypoint wrapper ────────────────────────────────────────────
+        // We always provide a real `main()` that initializes runtime subsystems,
+        // constructs the Network capability token, and calls the user entry
+        // function (the mangled `...__main`).
+        let user_main = module.declarations.iter().find_map(|decl| {
+            let DeclarationKind::Function {
+                name,
+                params,
+                return_type,
+                ..
+            } = &decl.node
+            else {
+                return None;
+            };
+            if !name.name.ends_with("__main") {
+                return None;
+            }
+            let ret_ty = return_type
+                .as_ref()
+                .map(|ty| b.lower_type(ty))
+                .unwrap_or_else(|| "void".to_string());
+            let wants_network =
+                params.len() == 1 && params[0].type_annotation.node.name == "Network";
+            Some((link_symbol_name(&name.name), ret_ty, wants_network))
+        });
+
+        let (callee_name, callee_ret_ty, wants_network) =
+            user_main.unwrap_or_else(|| ("".to_string(), "void".to_string(), false));
+
+        let mut entry_lines: Vec<String> = Vec::new();
+        entry_lines.push("entry:".to_string());
+        entry_lines.push("  %task_slot = alloca i8*".to_string());
+        entry_lines.push("  %task_init = call i8* @slab_arena_new()".to_string());
+        entry_lines.push("  store i8* %task_init, i8** %task_slot".to_string());
+        entry_lines.push("  call void @ty_sched_init()".to_string());
+        entry_lines.push("  call void @ty_io_subsystem_init()".to_string());
+        entry_lines.push("  call void @ty_net_init()".to_string());
+        entry_lines.push("  %task = load i8*, i8** %task_slot".to_string());
+        entry_lines.push("  %net = call %struct.Network* @ty_net_global()".to_string());
+        // Call user entry if present.
+        if !callee_name.is_empty() {
+            let mut args = vec!["i8* %task".to_string()];
+            if wants_network {
+                args.push("%struct.Network* %net".to_string());
+            }
+            if callee_ret_ty == "i32" {
+                entry_lines.push(format!(
+                    "  %user_ret = call i32 @{}({})",
+                    callee_name,
+                    args.join(", ")
+                ));
+            } else if callee_ret_ty == "void" {
+                entry_lines.push(format!("  call void @{}({})", callee_name, args.join(", ")));
+            } else {
+                entry_lines.push(format!(
+                    "  %ignored = call {} @{}({})",
+                    callee_ret_ty,
+                    callee_name,
+                    args.join(", ")
+                ));
+            }
+        }
+
+        entry_lines.push("  call void @ty_sched_shutdown()".to_string());
+        entry_lines.push("  call void @ty_net_shutdown()".to_string());
+        entry_lines.push("  call void @ty_io_subsystem_shutdown()".to_string());
+        entry_lines.push("  call void @slab_arena_free(i8* %task)".to_string());
+
+        if !callee_name.is_empty() && callee_ret_ty == "i32" {
+            entry_lines.push("  ret i32 %user_ret".to_string());
+        } else {
+            entry_lines.push("  ret i32 0".to_string());
+        }
+
+        all_functions.push(IrFunction {
+            name: "main".to_string(),
+            body: entry_lines.join("\n"),
+            ret_type: "i32".to_string(),
+            params: Vec::new(),
+        });
         IrModule {
             functions: all_functions,
             preamble: b.preamble(),
@@ -227,9 +307,28 @@ impl<'a> IrBuilder<'a> {
         for decl in [
             "%struct.Buf = type { i8*, i64, i64 }",
             "%struct.TyArray = type { i8*, i64, i64, i64, i64 }",
+            // Opaque runtime handles (passed as pointers only)
+            "%struct.Network = type { i8 }",
+            "%struct.Listener = type { i8 }",
+            "%struct.Socket = type { i8 }",
         ] {
             self.type_decls.push(decl.to_string());
         }
+
+        // Networking Result types referenced by runtime intrinsics below.
+        // Ensure their ADT layouts exist before we emit `declare` lines.
+        self.ensure_result("%struct.Listener*", "i32");
+        self.ensure_result("%struct.Socket*", "i32");
+        let res_listener_i32 = format!(
+            "%struct.Result__{}__{}",
+            mangle_llvm_type_name("%struct.Listener*"),
+            mangle_llvm_type_name("i32")
+        );
+        let res_socket_i32 = format!(
+            "%struct.Result__{}__{}",
+            mangle_llvm_type_name("%struct.Socket*"),
+            mangle_llvm_type_name("i32")
+        );
 
         for decl in [
             // ── scheduler ──
@@ -261,6 +360,10 @@ impl<'a> IrBuilder<'a> {
             "declare void @ty_io_subsystem_shutdown ()",
             "declare i32  @ty_io_open               (i8* %driver, i8* %path, i32 %flags, i32 %mode)",
             "declare void @ty_io_close              (i8* %driver, i32 %fd)",
+            // ── networking ───────────────────────────────────────────────────────────
+            "declare void @ty_net_init              ()",
+            "declare void @ty_net_shutdown          ()",
+            "declare %struct.Network* @ty_net_global()",
             // ── print family ──────────────────────────────────────────────────────────
             "declare void @ty_print    (i8* %task, i8* %s)",
             "declare void @ty_println  (i8* %task, i8* %s)",
@@ -279,9 +382,30 @@ impl<'a> IrBuilder<'a> {
             "declare i32  @ty_fscanf   (i8* %task, i32 %fd, i8* %fmt, ...)",
             "declare i8*  @ty_sscan    (i8* %task, i8* %src, i8** %rest_out)",
             "declare i32  @ty_sscanf   (i8* %task, i8* %src, i8* %fmt, ...)",
+            // ── Network / Listener / Socket methods (runtime-provided) ──────────────
+            // Result<Listener, Int32>
+            // Result<Socket, Int32>
         ] {
             self.extra_preamble.push(decl.to_string());
         }
+
+        // These declarations depend on the computed Result struct names above.
+        self.extra_preamble.push(format!(
+            "declare {} @__ty_method__Network__listen(i8* %task, %struct.Network* %self, i8* %addr)",
+            res_listener_i32
+        ));
+        self.extra_preamble.push(format!(
+            "declare {} @__ty_method__Listener__accept(i8* %task, %struct.Listener* %self)",
+            res_socket_i32
+        ));
+        self.extra_preamble.push(
+            "declare void @__ty_method__Socket__consume(i8* %task, %struct.Socket* %self, i8* %chan)"
+                .to_string(),
+        );
+        self.extra_preamble.push(
+            "declare void @__ty_method__Socket__close(i8* %task, %struct.Socket* %self)"
+                .to_string(),
+        );
 
         self.func_sigs
             .insert("__ty_buf_new".into(), ("%struct.Buf*".into(), vec![]));
@@ -293,6 +417,34 @@ impl<'a> IrBuilder<'a> {
             "__ty_buf_into_str".into(),
             ("i8*".into(), vec!["%struct.Buf*".into()]),
         );
+
+        // Runtime-provided networking methods.
+        self.func_sigs.insert(
+            "__ty_method__Network__listen".into(),
+            (
+                res_listener_i32,
+                vec!["i8*".into(), "%struct.Network*".into(), "i8*".into()],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Listener__accept".into(),
+            (
+                res_socket_i32,
+                vec!["i8*".into(), "%struct.Listener*".into()],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Socket__consume".into(),
+            (
+                "void".into(),
+                vec!["i8*".into(), "%struct.Socket*".into(), "i8*".into()],
+            ),
+        );
+        self.func_sigs.insert(
+            "__ty_method__Socket__close".into(),
+            ("void".into(), vec!["i8*".into(), "%struct.Socket*".into()]),
+        );
+
         self.func_sigs.insert(
             "ty_array_push".into(),
             ("void".into(), vec!["%struct.TyArray*".into(), "i8*".into()]),
@@ -324,6 +476,39 @@ impl<'a> IrBuilder<'a> {
         ); // chan, out_ptr -> i32
         self.func_sigs
             .insert("ty_chan_close".into(), ("void".into(), vec!["i8*".into()]));
+
+        // ── stdio intrinsics ──────────────────────────────────────────────────
+        // Keyed under both source names (what the call-site lookup uses) and
+        // runtime names. Param lists exclude the implicit leading `task` arg.
+        for (src, rt, ret, params) in [
+            ("print", "ty_print", "void", vec!["i8*"]),
+            ("println", "ty_println", "void", vec!["i8*"]),
+            ("printf", "ty_printf", "void", vec!["i8*"]),
+            ("fprint", "ty_fprint", "void", vec!["i32", "i8*"]),
+            ("fprintln", "ty_fprintln", "void", vec!["i32", "i8*"]),
+            ("fprintf", "ty_fprintf", "void", vec!["i32", "i8*"]),
+            ("sprint", "ty_sprint", "void", vec!["%struct.Buf*", "i8*"]),
+            (
+                "sprintln",
+                "ty_sprintln",
+                "void",
+                vec!["%struct.Buf*", "i8*"],
+            ),
+            ("sprintf", "ty_sprintf", "void", vec!["%struct.Buf*", "i8*"]),
+            ("scan", "ty_scan", "i8*", vec![]),
+            ("scanf", "ty_scanf", "i32", vec!["i8*"]),
+            ("fscan", "ty_fscan", "i8*", vec!["i32"]),
+            ("fscanf", "ty_fscanf", "i32", vec!["i32", "i8*"]),
+            ("sscan", "ty_sscan", "i8*", vec!["i8*", "i8**"]),
+            ("sscanf", "ty_sscanf", "i32", vec!["i8*", "i8*"]),
+        ] {
+            let sig = (
+                ret.to_string(),
+                params.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            self.func_sigs.insert(src.to_string(), sig.clone());
+            self.func_sigs.insert(rt.to_string(), sig);
+        }
 
         for decl in &module.declarations {
             match &decl.node {
@@ -628,6 +813,29 @@ impl<'a> IrBuilder<'a> {
                     self.emit("entry:".to_string());
                     self.emit_function_param("task".to_string(), "i8*".to_string());
                     self.emit_function_param("arg".to_string(), "i8*".to_string());
+
+                    // Even in the "no-capture" path the body may reference
+                    // variables from the enclosing scope by name (e.g. a
+                    // socket pointer passed into a spawned block).  Without
+                    // restoring the parent locals those identifiers fall
+                    // through to the "undefined identifier → 0" branch,
+                    // producing a null pointer that is immediately
+                    // dereferenced → segfault.
+                    //
+                    // We copy the parent locals into the trampoline scope,
+                    // excluding the hidden `task` and `arg` params that the
+                    // trampoline re-binds via emit_function_param above.
+                    for (name, slot) in &saved_locals {
+                        if name != "task" && name != "arg" {
+                            self.locals.insert(name.clone(), slot.clone());
+                        }
+                    }
+                    for (name, ty) in &saved_types {
+                        if name != "task" && name != "arg" {
+                            self.locals_type.insert(name.clone(), ty.clone());
+                        }
+                    }
+
                     self.emit_block_stmts(body, "void");
                     self.emit("  ret void".to_string());
 
@@ -1009,9 +1217,11 @@ impl<'a> IrBuilder<'a> {
         }
 
         let value = self.emit_expr(initializer);
+        let init_ty = self.expr_llvm_type(initializer);
         let ty = type_annotation
             .map(|t| self.lower_type(t))
-            .unwrap_or_else(|| self.expr_llvm_type(initializer));
+            .unwrap_or_else(|| init_ty.clone());
+        let value = self.emit_widen(&value, &init_ty, &ty);
 
         let is_heap_allocated = mutable && !ty.ends_with('*') && ty != "void";
 
@@ -1590,10 +1800,12 @@ impl<'a> IrBuilder<'a> {
                 let offset = if is_no_task_intrinsic(&id.name) { 1 } else { 2 };
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
+                    let actual_ty = self.expr_llvm_type(a);
                     let t = param_types
                         .get(i + offset)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
+                    let v = self.emit_widen(&v, &actual_ty, &t);
                     arg_pairs.push(format!("{} {}", t, v));
                 }
                 let tmp = self.tmp();
@@ -1853,10 +2065,12 @@ impl<'a> IrBuilder<'a> {
                 ];
                 for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a);
+                    let actual_ty = self.expr_llvm_type(a);
                     let t = param_types
                         .get(i + 2) // ← was i + 1, now offset by 2 (skip task + self)
                         .cloned()
                         .unwrap_or_else(|| "i32".to_string());
+                    let v = self.emit_widen(&v, &actual_ty, &t);
                     arg_pairs.push(format!("{} {}", t, v));
                 }
                 let tmp = self.tmp();
@@ -1936,10 +2150,12 @@ impl<'a> IrBuilder<'a> {
             }
             for (i, arg) in args.iter().enumerate() {
                 let v = self.emit_expr(arg);
+                let actual_ty = self.expr_llvm_type(arg);
                 let t = param_types
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| "i32".to_string());
+                let v = self.emit_widen(&v, &actual_ty, &t);
                 arg_pairs.push(format!("{} {}", t, v));
             }
             if ret_ty == "void" {
@@ -2454,6 +2670,9 @@ impl<'a> IrBuilder<'a> {
             "Buf" => "%struct.Buf*".to_string(),
             "Array" => "%struct.TyArray*".to_string(),
             "Chan" => "i8*".to_string(),
+            "Network" => "%struct.Network*".to_string(),
+            "Listener" => "%struct.Listener*".to_string(),
+            "Socket" => "%struct.Socket*".to_string(),
             "Option" => ty
                 .node
                 .generic_args
@@ -2500,6 +2719,9 @@ impl<'a> IrBuilder<'a> {
                 "Str" => "i8*".to_string(),
                 "Buf" => "%struct.Buf*".to_string(),
                 "Chan" => "i8*".to_string(),
+                "Network" => "%struct.Network*".to_string(),
+                "Listener" => "%struct.Listener*".to_string(),
+                "Socket" => "%struct.Socket*".to_string(),
                 n => format!("%struct.{}", n),
             },
             InferType::App(name, args) if name == "Ref" && args.len() == 1 => "i8*".to_string(),
@@ -2797,6 +3019,50 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
+    fn emit_widen(&mut self, val: &str, actual_ty: &str, expected_ty: &str) -> String {
+        if actual_ty == expected_ty {
+            return val.to_string();
+        }
+        let int_rank = |t: &str| -> Option<u8> {
+            match t {
+                "i8" => Some(0),
+                "i16" => Some(1),
+                "i32" => Some(2),
+                "i64" => Some(3),
+                _ => None,
+            }
+        };
+        let float_rank = |t: &str| -> Option<u8> {
+            match t {
+                "half" => Some(0),
+                "float" => Some(1),
+                "double" => Some(2),
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(e)) = (int_rank(actual_ty), int_rank(expected_ty)) {
+            if a < e {
+                let tmp = self.tmp();
+                self.emit(format!(
+                    "  {} = sext {} {} to {}",
+                    tmp, actual_ty, val, expected_ty
+                ));
+                return tmp;
+            }
+        }
+        if let (Some(a), Some(e)) = (float_rank(actual_ty), float_rank(expected_ty)) {
+            if a < e {
+                let tmp = self.tmp();
+                self.emit(format!(
+                    "  {} = fpext {} {} to {}",
+                    tmp, actual_ty, val, expected_ty
+                ));
+                return tmp;
+            }
+        }
+        val.to_string()
+    }
+
     fn zero_value(&self, ty: &str) -> String {
         if ty.ends_with('*') {
             "null".to_string()
@@ -3060,7 +3326,11 @@ impl<'a> IrBuilder<'a> {
 // ── Free functions ────────────────────────────────────────────────────────────
 
 fn is_main(name: &str) -> bool {
-    return name == "main" || name.ends_with("__main");
+    // The real OS entrypoint `main()` is synthesized by the compiler.
+    // All user-declared functions (including the user entry function) receive
+    // the hidden `%task` parameter.
+    let _ = name;
+    false
 }
 
 fn int_suffix_to_llvm(suffix: &str) -> &'static str {
@@ -3168,8 +3438,11 @@ fn runtime_intrinsic_name(name: &str) -> Option<String> {
 }
 
 fn link_symbol_name(name: &str) -> String {
-    if name == "main__main" {
-        "main".to_string()
+    // Keep a stable OS entrypoint symbol (`main`) and route the user entry
+    // function through a distinct symbol to avoid collisions (notably in unit
+    // tests that parse a single file without namespace mangling).
+    if name == "main" || name == "main__main" {
+        "__ty_user_main".to_string()
     } else {
         name.to_string()
     }
@@ -3252,9 +3525,9 @@ mod tests {
             .clone();
         let ir = Codegen::lower_module(&module, checker.types(), &drop_map);
         assert_eq!(ir.functions.len(), 2);
-        assert_eq!(ir.functions[0].name, "main");
+        assert_eq!(ir.functions[0].name, "__ty_user_main");
         assert_eq!(ir.functions[0].ret_type, "i32");
-        assert_eq!(ir.functions[0].params.len(), 0);
+        assert_eq!(ir.functions[0].params.len(), 2);
     }
 
     #[test]

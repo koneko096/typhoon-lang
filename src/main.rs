@@ -85,6 +85,10 @@ fn main() {
     // 4. Set the library name
     // Clang will find runtime.lib on Windows or libruntime.a on Unix
     cmd.arg("-lruntime");
+    // Networking runtime uses Winsock on Windows.
+    if cfg!(windows) {
+        cmd.arg("-lWs2_32");
+    }
 
     // 5. Platform-Specific Glue
     if cfg!(windows) {
